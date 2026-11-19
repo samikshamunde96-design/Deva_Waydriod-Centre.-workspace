@@ -45,7 +45,7 @@ In the app:
 ## Static checks
 
 ```bash
-cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --lib
 cd .. && npx tsc --noEmit && npm run build
 ```
 
