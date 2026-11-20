@@ -503,9 +503,19 @@ async fn action_start(
     base_url: String,
     model: String,
     max_steps: Option<u32>,
+    safety: Option<String>,
 ) -> Result<agent::ActionTaskView, String> {
-    let view =
-        blocking(move || agent::start(&prompt, &provider, &base_url, &model, max_steps)).await;
+    let view = blocking(move || {
+        agent::start(
+            &prompt,
+            &provider,
+            &base_url,
+            &model,
+            max_steps,
+            safety.as_deref(),
+        )
+    })
+    .await;
     match &view {
         Ok(view) => activity::record("info", "AI action started", view.prompt.clone()),
         Err(error) => activity::record("error", "AI action", error.clone()),

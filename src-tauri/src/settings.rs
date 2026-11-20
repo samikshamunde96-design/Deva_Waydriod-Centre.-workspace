@@ -18,6 +18,7 @@ pub struct Settings {
     pub chat_model: String,
     pub action_provider: String,
     pub action_model: String,
+    pub action_safety: String,
     pub openai_base_url: String,
     pub ollama_base_url: String,
     pub auto_refresh: bool,
@@ -33,6 +34,7 @@ impl Default for Settings {
             chat_model: String::new(),
             action_provider: "ollama".to_string(),
             action_model: String::new(),
+            action_safety: "confirm_mutations".to_string(),
             openai_base_url: crate::providers::DEFAULT_OPENAI_URL.to_string(),
             ollama_base_url: crate::providers::DEFAULT_OLLAMA_URL.to_string(),
             auto_refresh: false,
@@ -58,6 +60,7 @@ impl Settings {
         crate::providers::validate_provider(&self.action_provider)?;
         crate::providers::validate_model_name(&self.chat_model)?;
         crate::providers::validate_model_name(&self.action_model)?;
+        crate::agent::SafetyMode::parse(&self.action_safety)?;
         crate::providers::validate_base_url(&self.openai_base_url)?;
         crate::providers::validate_base_url(&self.ollama_base_url)?;
         if self.last_android_directory.trim().is_empty()

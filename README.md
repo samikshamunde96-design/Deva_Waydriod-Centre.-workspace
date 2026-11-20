@@ -29,7 +29,8 @@ every command succeeds.
   save a screenshot
 - **AI** — two independent systems: *Chat* (conversation only) and *Action*
   (a bounded agent that reaches the device through a fixed backend tool
-  registry, with approval for uninstalls)
+  registry, with configurable execution safety and approval for consequential
+  actions)
 - **Device Settings** — display size and density overrides via Android `wm`
 - **Activity Logs** — in-memory outcome log for every backend action
 
@@ -60,5 +61,11 @@ npm run tauri dev
 - Both AI systems need a reachable endpoint: `ollama` on `localhost:11434`
   (`ollama serve`), or an OpenAI-compatible `/chat/completions` URL with a
   session-only key. Chat and Action have separate provider/model settings; the
-  Action engine cannot run shell commands and refuses to report success without
-  a tool result that verifies it.
+  AI panel reports live connection checks, available models and the last
+  successful check. Action history and tool schemas are retained in memory for
+  the current app session only.
+- Action safety modes are read-only, confirm mutations, confirm every action,
+  and trusted low-risk (volume keys only; other mutations still require
+  approval). The Action engine cannot run shell commands. Generic UI input
+  remains subject to confirmation, and a successful command alone is not
+  treated as proof that the requested device state occurred.

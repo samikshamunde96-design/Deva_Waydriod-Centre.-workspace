@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::http::{self, Response};
 
@@ -66,6 +67,7 @@ pub struct ProviderHealth {
     pub credential_configured: bool,
     pub detail: String,
     pub models: Vec<ModelMetadata>,
+    pub last_successful_verification: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -108,6 +110,7 @@ pub struct Completion {
 }
 
 static CREDENTIALS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static PROVIDER_SUCCESS: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
 
 fn credentials() -> &'static Mutex<HashMap<String, String>> {
     CREDENTIALS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -669,15 +672,31 @@ pub fn probe_model(
 
 pub fn health(provider: &str, base_url: &str) -> ProviderHealth {
     let base_url = validate_base_url(base_url).unwrap_or_else(|_| base_url.to_string());
+    let key = format!("{provider}|{base_url}");
+    let successful_verifications = PROVIDER_SUCCESS.get_or_init(|| Mutex::new(HashMap::new()));
+    let last_successful_verification = successful_verifications
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).copied());
     match list_models(provider, &base_url) {
-        Ok(models) => ProviderHealth {
-            provider: provider.to_string(),
-            base_url,
-            reachable: true,
-            credential_configured: has_credential(provider),
-            detail: format!("Connected. {} model(s) available.", models.len()),
-            models,
-        },
+        Ok(models) => {
+            let verified_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_secs())
+                .unwrap_or_default();
+            if let Ok(mut cache) = successful_verifications.lock() {
+                cache.insert(key, verified_at);
+            }
+            ProviderHealth {
+                provider: provider.to_string(),
+                base_url,
+                reachable: true,
+                credential_configured: has_credential(provider),
+                detail: format!("Connected. {} model(s) available.", models.len()),
+                models,
+                last_successful_verification: Some(verified_at),
+            }
+        }
         Err(error) => ProviderHealth {
             provider: provider.to_string(),
             base_url,
@@ -685,6 +704,7 @@ pub fn health(provider: &str, base_url: &str) -> ProviderHealth {
             credential_configured: has_credential(provider),
             detail: redact_secrets(&error),
             models: Vec::new(),
+            last_successful_verification,
         },
     }
 }

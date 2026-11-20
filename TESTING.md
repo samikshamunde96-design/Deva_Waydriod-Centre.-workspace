@@ -17,9 +17,15 @@ unit tests cover:
 - workflow step/report aggregation and unknown-workflow rejection
 - provider request shaping, model-name/message validation and credential redaction
 - Action engine tool registry, typed argument validation, duplicate and
-  malformed-call rejection, step/deadline limits and cancellation
+  malformed-call rejection, safety modes, honest verification states,
+  step/deadline limits and cancellation
 - settings validation, atomic save and corrupt-file recovery
 - activity log ordering
+
+`npm test` runs the mocked React/Tauri UI tests. They cover independent provider
+selections, model discovery, provider health and errors, Action approval,
+cancellation, execution history and completion/verification states. They do
+not invoke a provider or device.
 
 ## Manual verification against the live host
 
@@ -43,13 +49,15 @@ In the app:
 5. Automation → *Save a screenshot* writes a PNG to `~/Pictures`.
 6. Device Settings → read current size/density, apply an override, reset it.
 7. Activity Logs → the actions above are listed with their outcomes.
-8. AI Assistant → reload models, send a prompt (requires `ollama serve`).
+8. AI Assistant → check provider health, discover models, send a Chat message
+   and review Action tasks (requires a reachable provider and explicit approval
+   for requested consequential operations).
 
 ## Static checks
 
 ```bash
 cd src-tauri && cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test --lib
-cd .. && npx tsc --noEmit && npm run build
+cd .. && npx tsc --noEmit && npm test && npm run build
 ```
 
 Tauri commands are `async` so multi-second ADB probes never block the webview

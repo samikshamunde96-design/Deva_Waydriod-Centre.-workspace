@@ -128,6 +128,7 @@ type AiSettings = {
   chat_model: string;
   action_provider: string;
   action_model: string;
+  action_safety: string;
   openai_base_url: string;
   ollama_base_url: string;
   auto_refresh: boolean;
@@ -190,9 +191,40 @@ type ActionTask = {
   started_at: number;
   finished_at: number | null;
   max_steps: number;
+  safety: string;
+  actions_attempted: number;
+  actions_run: number;
+  actions_failed: number;
+  actions_blocked: number;
+  verification: string;
 };
 
-const terminalTaskStatuses = new Set(["completed", "failed", "cancelled"]);
+type ProviderHealth = {
+  provider: string;
+  base_url: string;
+  reachable: boolean;
+  credential_configured: boolean | null;
+  detail: string;
+  models: ModelMetadata[];
+  last_successful_verification: number | null;
+};
+
+type ToolDescription = {
+  type: string;
+  function: {
+    name: string;
+    description: string;
+    parameters: unknown;
+  };
+};
+
+const terminalTaskStatuses = new Set([
+  "completed",
+  "needs_verification",
+  "partially_completed",
+  "failed",
+  "cancelled",
+]);
 
 function defaultSettings(): AiSettings {
   return {
@@ -202,6 +234,7 @@ function defaultSettings(): AiSettings {
     chat_model: "",
     action_provider: "ollama",
     action_model: "",
+    action_safety: "confirm_mutations",
     openai_base_url: "https://api.openai.com/v1",
     ollama_base_url: "http://127.0.0.1:11434",
     auto_refresh: false,
@@ -338,8 +371,12 @@ function App() {
   const [capabilityNote, setCapabilityNote] = useState("");
   const [actionPrompt, setActionPrompt] = useState("");
   const [actionTask, setActionTask] = useState<ActionTask | null>(null);
+  const [actionHistory, setActionHistory] = useState<ActionTask[]>([]);
+  const [actionTools, setActionTools] = useState<ToolDescription[]>([]);
   const [actionError, setActionError] = useState("");
   const [actionBusy, setActionBusy] = useState(false);
+  const [chatHealth, setChatHealth] = useState<ProviderHealth | null>(null);
+  const [actionHealth, setActionHealth] = useState<ProviderHealth | null>(null);
   const restartDialog = useRef<HTMLDialogElement>(null);
   const stopDialog = useRef<HTMLDialogElement>(null);
   const installDialog = useRef<HTMLDialogElement>(null);
@@ -825,25 +862,37 @@ function App() {
     return provider === "ollama" ? settings.ollama_base_url : settings.openai_base_url;
   }
 
+  async function loadActionHistory() {
+    try {
+      setActionHistory(await invoke<ActionTask[]>("action_list"));
+      setActionTools(await invoke<ToolDescription[]>("action_tools"));
+    } catch (error) {
+      setActionError(String(error));
+    }
+  }
+
   async function loadModels(role: "chat" | "action") {
     const provider = role === "chat" ? settings.chat_provider : settings.action_provider;
     const baseUrl = baseUrlFor(provider);
-    setChatError("");
     setCapabilityNote("");
     try {
-      const found = await invoke<ModelMetadata[]>("list_provider_models", {
+      const health = await invoke<ProviderHealth>("provider_health", {
         provider,
         baseUrl,
       });
-      const names = found.map((model) => model.name);
+      if (role === "chat") setChatHealth(health);
+      else setActionHealth(health);
+      const names = health.reachable ? health.models.map((model) => model.name) : [];
       if (role === "chat") {
         setModels(names);
+        setChatError(health.reachable ? "" : health.detail);
         if (!names.includes(settings.chat_model)) {
           const next = { ...settings, chat_model: names[0] ?? "" };
           await persistSettings(next, "Chat model updated from the provider list.");
         }
       } else {
         setActionModels(names);
+        setActionError(health.reachable ? "" : health.detail);
         if (!names.includes(settings.action_model)) {
           await persistSettings(
             { ...settings, action_model: names[0] ?? "" },
@@ -852,12 +901,24 @@ function App() {
         }
       }
     } catch (error) {
+      const detail = String(error);
+      const unavailable: ProviderHealth = {
+        provider,
+        base_url: baseUrl,
+        reachable: false,
+        credential_configured: null,
+        detail,
+        models: [],
+        last_successful_verification: null,
+      };
       if (role === "chat") {
         setModels([]);
-        setChatError(String(error));
+        setChatHealth(unavailable);
+        setChatError(detail);
       } else {
         setActionModels([]);
-        setActionError(String(error));
+        setActionHealth(unavailable);
+        setActionError(detail);
       }
     }
   }
@@ -952,8 +1013,10 @@ function App() {
         baseUrl: baseUrlFor(settings.action_provider),
         model: settings.action_model,
         maxSteps: 6,
+        safety: settings.action_safety,
       });
       setActionTask(task);
+      await loadActionHistory();
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -974,6 +1037,7 @@ function App() {
           approved,
         }),
       );
+      await loadActionHistory();
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -986,6 +1050,7 @@ function App() {
     setActionBusy(true);
     try {
       setActionTask(await invoke<ActionTask>("action_cancel", { runId: actionTask.id }));
+      await loadActionHistory();
     } catch (error) {
       setActionError(String(error));
     } finally {
@@ -1031,11 +1096,23 @@ function App() {
     if (activeNav === "logs") {
       void loadLog();
     }
-    if (activeNav === "assistant" && models.length === 0) {
-      void loadModels("chat");
+    if (activeNav === "assistant") {
+      void loadActionHistory();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeNav, currentStatus.selected_device?.serial]);
+
+  useEffect(() => {
+    if (activeNav === "assistant") void loadModels("chat");
+    // Load only when Chat's provider selection changes or the assistant opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeNav, settings.chat_provider]);
+
+  useEffect(() => {
+    if (activeNav === "assistant") void loadModels("action");
+    // Load only when Action's provider selection changes or the assistant opens.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeNav, settings.action_provider]);
 
   useEffect(() => {
     const task = actionTask;
@@ -1046,9 +1123,14 @@ function App() {
     const timer = window.setInterval(() => {
       void invoke<ActionTask>("action_get", { runId: task.id })
         .then((next) => {
-          if (!cancelled) setActionTask(next);
+          if (!cancelled) {
+            setActionTask(next);
+            if (terminalTaskStatuses.has(next.status)) void loadActionHistory();
+          }
         })
-        .catch(() => {});
+        .catch((error) => {
+          if (!cancelled) setActionError(`Task progress could not be refreshed: ${String(error)}`);
+        });
     }, 1500);
     return () => {
       cancelled = true;
@@ -1588,6 +1670,7 @@ function App() {
               Provider
               <select
                 value={settings.chat_provider}
+                aria-label="Chat provider"
                 onChange={(event) =>
                   void persistSettings(
                     { ...settings, chat_provider: event.target.value, chat_model: "" },
@@ -1611,7 +1694,11 @@ function App() {
                       : { openai_base_url: event.target.value }),
                   })
                 }
-                onBlur={() => void persistSettings(settings, "Chat base URL saved.")}
+                onBlur={() =>
+                  void persistSettings(settings, "Chat base URL saved.").then(() =>
+                    loadModels("chat"),
+                  )
+                }
                 aria-label="Chat provider base URL"
               />
             </label>
@@ -1619,6 +1706,7 @@ function App() {
               Model
               <select
                 value={settings.chat_model}
+                aria-label="Chat model"
                 onChange={(event) => {
                   void persistSettings(
                     { ...settings, chat_model: event.target.value },
@@ -1640,25 +1728,6 @@ function App() {
             </button>
           </div>
 
-          {settings.chat_provider === "openai_compatible" && (
-            <div className="field-grid">
-              <label>
-                Session API key
-                <input
-                  type="password"
-                  value={credentialInput}
-                  onChange={(event) => setCredentialInput(event.target.value)}
-                  autoComplete="off"
-                  placeholder="Not stored on disk"
-                />
-              </label>
-              <div className="toolbar-row">
-                <button type="button" onClick={() => void saveCredential()}>Use for this session</button>
-                <button type="button" className="ghost" onClick={() => void forgetCredential()}>Forget key</button>
-              </div>
-              {credentialStatus && <p className="hint">{credentialStatus}</p>}
-            </div>
-          )}
         </article>
 
         <article className="mini-card">
@@ -1668,6 +1737,7 @@ function App() {
               Provider
               <select
                 value={settings.action_provider}
+                aria-label="Action provider"
                 onChange={(event) =>
                   void persistSettings(
                     { ...settings, action_provider: event.target.value, action_model: "" },
@@ -1691,7 +1761,11 @@ function App() {
                       : { openai_base_url: event.target.value }),
                   })
                 }
-                onBlur={() => void persistSettings(settings, "Action base URL saved.")}
+                onBlur={() =>
+                  void persistSettings(settings, "Action base URL saved.").then(() =>
+                    loadModels("action"),
+                  )
+                }
                 aria-label="Action provider base URL"
               />
             </label>
@@ -1699,6 +1773,7 @@ function App() {
               Model
               <select
                 value={settings.action_model}
+                aria-label="Action model"
                 onChange={(event) => {
                   void persistSettings(
                     { ...settings, action_model: event.target.value },
@@ -1713,21 +1788,87 @@ function App() {
                 ))}
               </select>
             </label>
+            <label>
+              Safety mode
+              <select
+                value={settings.action_safety}
+                onChange={(event) =>
+                  void persistSettings(
+                    { ...settings, action_safety: event.target.value },
+                    "Action safety mode saved.",
+                  )
+                }
+              >
+                <option value="read_only">Read-only inspection</option>
+                <option value="confirm_mutations">Confirm before mutations</option>
+                <option value="confirm_every_action">Confirm every action</option>
+                <option value="trusted_low_risk">Trust volume keys only; confirm other changes</option>
+              </select>
+            </label>
           </div>
           <div className="toolbar-row">
             <button type="button" className="ghost" onClick={() => void loadModels("action")}>
               Reload models
             </button>
           </div>
-          {settings.action_provider === "openai_compatible" && (
-            <p className="hint">
-              Uses the session key configured for the chat provider. Nothing is written to disk.
-            </p>
-          )}
         </article>
       </div>
 
+      {(settings.chat_provider === "openai_compatible" ||
+        settings.action_provider === "openai_compatible") && (
+        <article className="mini-card">
+          <h3>Shared OpenAI-compatible credential</h3>
+          <div className="field-grid">
+            <label>
+              Session API key
+              <input
+                type="password"
+                value={credentialInput}
+                onChange={(event) => setCredentialInput(event.target.value)}
+                autoComplete="off"
+                placeholder="Not stored on disk"
+              />
+            </label>
+            <div className="toolbar-row">
+              <button type="button" onClick={() => void saveCredential()}>Use for this session</button>
+              <button type="button" className="ghost" onClick={() => void forgetCredential()}>Forget key</button>
+            </div>
+            {credentialStatus && <p className="hint">{credentialStatus}</p>}
+          </div>
+        </article>
+      )}
+
       {capabilityNote && <p className="hint" role="status">{capabilityNote}</p>}
+
+      <div className="provider-health-grid" aria-label="Provider connection status">
+        {(["chat", "action"] as const).map((role) => {
+          const health = role === "chat" ? chatHealth : actionHealth;
+          const provider = role === "chat" ? settings.chat_provider : settings.action_provider;
+          const model = role === "chat" ? settings.chat_model : settings.action_model;
+          return (
+            <article className="mini-card provider-health" key={role}>
+              <div className="provider-health-heading">
+                <h3>{role === "chat" ? "Chat provider" : "Action provider"}</h3>
+                <span className={`pill ${health?.reachable ? "good" : "bad"}`}>
+                  {health ? (health.reachable ? "Connected" : "Unreachable") : "Not checked"}
+                </span>
+              </div>
+              <p><strong>Provider:</strong> {provider}</p>
+              <p><strong>Selected model:</strong> {model || "None"}</p>
+              <p><strong>URL:</strong> {health?.base_url || baseUrlFor(provider)}</p>
+              <p>
+                <strong>Last successful verification:</strong>{" "}
+                {health?.last_successful_verification
+                  ? new Date(health.last_successful_verification * 1000).toLocaleString()
+                  : "Never"}
+              </p>
+              {health && !health.reachable && (
+                <p className="health-error" role="alert">{health.detail}</p>
+              )}
+            </article>
+          );
+        })}
+      </div>
 
       <div className="panel-head">
         <div>
@@ -1822,7 +1963,10 @@ function App() {
             </span>
           </h3>
           <p className="hint">
-            {actionTask.provider} / {actionTask.model} · step budget {actionTask.max_steps}
+            {actionTask.provider} / {actionTask.model} · {actionTask.safety} · step budget {actionTask.max_steps}
+          </p>
+          <p className="hint">
+            Actions attempted: {actionTask.actions_attempted} · executed: {actionTask.actions_run} · successful: {actionTask.actions_run - actionTask.actions_failed} · failed: {actionTask.actions_failed} · not executed: {actionTask.actions_blocked} · verification: {actionTask.verification}
           </p>
           <ol className="step-list">
             {actionTask.steps.map((step) => (
@@ -1852,6 +1996,76 @@ function App() {
           )}
           {actionTask.error && <div className="empty-state" role="alert">{actionTask.error}</div>}
         </section>
+      )}
+
+      <div className="panel-head">
+        <div>
+          <h2>Action history</h2>
+          <p>Recent tasks retained by this app session, including prompts and verification evidence.</p>
+        </div>
+        <button type="button" className="ghost" onClick={() => void loadActionHistory()}>
+          Refresh
+        </button>
+      </div>
+
+      {actionHistory.length === 0 ? (
+        <div className="empty-state">No Action tasks yet.</div>
+      ) : (
+        <div className="action-history">
+          {actionHistory.map((task) => (
+            <article className="mini-card action-history-item" key={task.id}>
+              <div className="provider-health-heading">
+                <button
+                  type="button"
+                  className="history-title"
+                  onClick={() => setActionTask(task)}
+                >
+                  {task.prompt}
+                </button>
+                <span className={`pill ${task.status === "completed" ? "good" : task.status === "failed" ? "bad" : "warn"}`}>
+                  {task.status}
+                </span>
+              </div>
+              <p className="hint">
+                {task.provider} / {task.model} · {task.safety}
+              </p>
+              <p className="hint">
+                Attempted {task.actions_attempted} · executed {task.actions_run} · successful {task.actions_run - task.actions_failed} · failed {task.actions_failed} · not executed {task.actions_blocked} · verification {task.verification}
+              </p>
+              {task.pending_approval && (
+                <p role="status"><strong>Approval request:</strong> {task.pending_approval.summary}</p>
+              )}
+              {task.error && <p className="health-error" role="alert">{task.error}</p>}
+              {task.result && <p>{task.result}</p>}
+              <details>
+                <summary>Execution details ({task.steps.length} steps)</summary>
+                <ol className="step-list">
+                  {task.steps.map((step) => (
+                    <li key={step.index} className={step.ok ? "step ok" : "step error"}>
+                      <strong>{step.title}</strong>
+                      <span>{step.detail}</span>
+                    </li>
+                  ))}
+                </ol>
+              </details>
+            </article>
+          ))}
+        </div>
+      )}
+
+      {actionTools.length > 0 && (
+        <details className="tool-schema">
+          <summary>Available Action tools and input schemas</summary>
+          <div className="tool-list">
+            {actionTools.map((tool) => (
+              <article className="mini-card" key={tool.function.name}>
+                <h3>{tool.function.name}</h3>
+                <p>{tool.function.description}</p>
+                <pre>{JSON.stringify(tool.function.parameters, null, 2)}</pre>
+              </article>
+            ))}
+          </div>
+        </details>
       )}
     </section>
   );

@@ -35,13 +35,14 @@ const SYSTEM_PROMPT: &str = "\
 You operate a real Android device through the tools provided. Follow these rules strictly:
 1. Call exactly one tool per turn. Never invent tool names or arguments.
 2. Observe before you act: use get_device_status and get_screen to understand the current state.
-3. After a UI action (tap, swipe, press_key, input_text) capture the screen again before claiming it worked.
-4. Only state that a task succeeded when a tool result verifies it. If verification is not possible, say so plainly.
-5. Never claim a tool ran, or that something changed, unless its result says so.
-6. If a tool fails, read the error, adjust once, and explain the limitation instead of repeating the same call.
-7. Destructive actions require user approval and may be declined. Do not try to work around a refusal.
-8. The device is a real user's Android environment. Do not attempt to bypass confirmations or privacy settings.
-9. Finish with a short report of what was verified, what was not, and the next safe step.";
+3. Treat every screen action as potentially consequential and follow the user's selected safety mode.
+4. After a UI action (tap, swipe, press_key, input_text) capture the screen again before reporting progress.
+5. A successful input command or frame-metadata capture alone does not prove the intended result. Only claim success when a tool provides meaningful confirmation.
+6. Never claim a tool ran, or that something changed, unless its result says so.
+7. If a tool fails, read the error, adjust once, and explain the limitation instead of repeating the same call.
+8. Destructive actions require user approval and may be declined. Do not try to work around a refusal.
+9. The device is a real user's Android environment. Do not attempt to bypass confirmations or privacy settings.
+10. Finish with a short report of what was verified, what was not, and the next safe step.";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum RunStatus {
@@ -49,6 +50,11 @@ pub enum RunStatus {
     AwaitingApproval,
     Cancelling,
     Completed,
+    /// A mutation ran, but no tool-specific evidence establishes the requested
+    /// device state.
+    NeedsVerification,
+    /// Some tool calls failed along the way; part of the task may have happened.
+    PartiallyCompleted,
     Failed,
     Cancelled,
 }
@@ -60,6 +66,8 @@ impl RunStatus {
             RunStatus::AwaitingApproval => "awaiting_approval",
             RunStatus::Cancelling => "cancelling",
             RunStatus::Completed => "completed",
+            RunStatus::NeedsVerification => "needs_verification",
+            RunStatus::PartiallyCompleted => "partially_completed",
             RunStatus::Failed => "failed",
             RunStatus::Cancelled => "cancelled",
         }
@@ -68,8 +76,49 @@ impl RunStatus {
     fn terminal(&self) -> bool {
         matches!(
             self,
-            RunStatus::Completed | RunStatus::Failed | RunStatus::Cancelled
+            RunStatus::Completed
+                | RunStatus::NeedsVerification
+                | RunStatus::PartiallyCompleted
+                | RunStatus::Failed
+                | RunStatus::Cancelled
         )
+    }
+}
+
+/// How much the Action engine may do without the user in the loop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafetyMode {
+    /// No tool may change the device.
+    ReadOnly,
+    /// Every tool that changes device state needs approval.
+    ConfirmMutations,
+    /// Every tool call, including read-only ones, needs approval.
+    ConfirmEveryAction,
+    /// Only volume adjustment keys run unattended. Other device changes need
+    /// approval because their screen-level impact cannot be inferred safely.
+    TrustedLowRisk,
+}
+
+impl SafetyMode {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim() {
+            "read_only" => Ok(SafetyMode::ReadOnly),
+            "confirm_mutations" => Ok(SafetyMode::ConfirmMutations),
+            "confirm_every_action" => Ok(SafetyMode::ConfirmEveryAction),
+            "trusted_low_risk" => Ok(SafetyMode::TrustedLowRisk),
+            other => Err(format!(
+                "Unknown safety mode '{other}'. Use read_only, confirm_mutations, confirm_every_action or trusted_low_risk."
+            )),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SafetyMode::ReadOnly => "read_only",
+            SafetyMode::ConfirmMutations => "confirm_mutations",
+            SafetyMode::ConfirmEveryAction => "confirm_every_action",
+            SafetyMode::TrustedLowRisk => "trusted_low_risk",
+        }
     }
 }
 
@@ -106,6 +155,13 @@ pub struct ActionTaskView {
     pub started_at: u64,
     pub finished_at: Option<u64>,
     pub max_steps: u32,
+    pub safety: String,
+    pub actions_attempted: u32,
+    pub actions_run: u32,
+    pub actions_failed: u32,
+    pub actions_blocked: u32,
+    /// `verified`, `readback_only`, `unverified` or `no_device_change`.
+    pub verification: String,
 }
 
 struct PendingAction {
@@ -134,9 +190,16 @@ struct ActionRun {
     finished_at: Option<u64>,
     steps_taken: u32,
     max_steps: u32,
-    /// Number of tools that actually ran; a "completed" report needs at least
-    /// one, otherwise nothing about the device was verified.
+    /// Number of tool calls that executed, excluding rejected or blocked calls.
     actions_run: u32,
+    actions_failed: u32,
+    actions_blocked: u32,
+    /// Tools that changed device state and the read-backs after the last one.
+    mutations: u32,
+    verified_after_mutation: bool,
+    readback_after_mutation: bool,
+    safety: SafetyMode,
+    actions_attempted: u32,
 }
 
 impl ActionRun {
@@ -158,6 +221,20 @@ impl ActionRun {
             detail: detail.into(),
             ok,
         });
+    }
+
+    fn record_action(&mut self, action: &PlannedAction, outcome: &ExecOutcome) {
+        self.actions_run += 1;
+        if !outcome.ok {
+            self.actions_failed += 1;
+        }
+        if action.is_mutation() {
+            self.mutations += 1;
+            self.verified_after_mutation = outcome.verified;
+            self.readback_after_mutation = false;
+        } else if action.is_readback() && self.mutations > 0 && outcome.ok {
+            self.readback_after_mutation = true;
+        }
     }
 
     fn finish(&mut self, status: RunStatus, result: Option<String>, error: Option<String>) {
@@ -208,7 +285,67 @@ impl ActionRun {
             started_at: self.started_at,
             finished_at: self.finished_at,
             max_steps: self.max_steps,
+            safety: self.safety.label().to_string(),
+            actions_run: self.actions_run,
+            actions_failed: self.actions_failed,
+            actions_blocked: self.actions_blocked,
+            actions_attempted: self.actions_attempted,
+            verification: self.verification().to_string(),
         }
+    }
+
+    fn verification(&self) -> &'static str {
+        if self.mutations == 0 {
+            "no_device_change"
+        } else if self.verified_after_mutation {
+            "verified"
+        } else if self.readback_after_mutation {
+            "readback_only"
+        } else {
+            "unverified"
+        }
+    }
+
+    /// A model that stops talking is not evidence that the task worked. Success
+    /// needs every action to have succeeded and a tool-specific confirmation
+    /// of the requested device state, not just a successful command/read-back.
+    fn completion_status(&self) -> (RunStatus, Option<String>) {
+        if self.actions_failed > 0 {
+            return (
+                RunStatus::PartiallyCompleted,
+                Some(format!(
+                    "{} of {} actions failed. The device may be in a partial state; review the steps before retrying.",
+                    self.actions_failed, self.actions_run
+                )),
+            );
+        }
+        if self.actions_blocked > 0 {
+            return (
+                if self.actions_run > 0 {
+                    RunStatus::PartiallyCompleted
+                } else {
+                    RunStatus::Failed
+                },
+                Some(format!(
+                    "{} action(s) were not executed because of the read-only safety policy or a declined approval.",
+                    self.actions_blocked
+                )),
+            );
+        }
+        if self.mutations > 0 && !self.verified_after_mutation {
+            return (
+                RunStatus::NeedsVerification,
+                Some(
+                    if self.readback_after_mutation {
+                        "A read-back succeeded, but the available tool output does not establish that the requested device state occurred. Verify it in the Android interface."
+                    } else {
+                        "The device may have changed, but no successful read-back or tool-specific verification followed. Verify it in the Android interface."
+                    }
+                        .to_string(),
+                ),
+            );
+        }
+        (RunStatus::Completed, None)
     }
 }
 
@@ -524,8 +661,50 @@ impl PlannedAction {
         }
     }
 
-    fn requires_approval(&self) -> bool {
-        matches!(self, PlannedAction::Uninstall { .. })
+    fn is_mutation(&self) -> bool {
+        matches!(
+            self,
+            PlannedAction::Launch { .. }
+                | PlannedAction::Tap { .. }
+                | PlannedAction::Swipe { .. }
+                | PlannedAction::PressKey { .. }
+                | PlannedAction::InputText { .. }
+                | PlannedAction::Uninstall { .. }
+        )
+    }
+
+    fn is_readback(&self) -> bool {
+        matches!(
+            self,
+            PlannedAction::DeviceStatus
+                | PlannedAction::Screen
+                | PlannedAction::InstalledApps { .. }
+                | PlannedAction::AppInfo { .. }
+                | PlannedAction::ListFiles { .. }
+        )
+    }
+
+    fn is_verified_mutation(&self) -> bool {
+        matches!(
+            self,
+            PlannedAction::Launch { .. } | PlannedAction::Uninstall { .. }
+        )
+    }
+
+    fn is_trusted_low_risk(&self) -> bool {
+        matches!(
+            self,
+            PlannedAction::PressKey { key } if matches!(key.as_str(), "volume_down" | "volume_up")
+        )
+    }
+
+    fn requires_approval(&self, safety: SafetyMode) -> bool {
+        match safety {
+            SafetyMode::ReadOnly => false,
+            SafetyMode::ConfirmMutations => self.is_mutation(),
+            SafetyMode::ConfirmEveryAction => true,
+            SafetyMode::TrustedLowRisk => self.is_mutation() && !self.is_trusted_low_risk(),
+        }
     }
 
     fn summary(&self) -> String {
@@ -674,6 +853,7 @@ fn validate_input_text(text: &str) -> Result<(), String> {
 struct ExecOutcome {
     ok: bool,
     detail: String,
+    verified: bool,
 }
 
 fn truncate(text: String) -> String {
@@ -799,14 +979,17 @@ fn execute(action: &PlannedAction) -> ExecOutcome {
         }),
     };
 
+    let verified = result.is_ok() && action.is_verified_mutation();
     match result {
         Ok(detail) => ExecOutcome {
             ok: true,
             detail: truncate(detail),
+            verified,
         },
         Err(error) => ExecOutcome {
             ok: false,
             detail: truncate(error),
+            verified: false,
         },
     }
 }
@@ -930,8 +1113,14 @@ fn advance_inner(handle: &RunHandle) -> Result<(), String> {
                     ));
                     return Ok(());
                 }
-                run.push_step("result", "Model report", text.clone(), true);
-                run.finish(RunStatus::Completed, Some(text), None);
+                let (status, error) = run.completion_status();
+                run.push_step(
+                    "result",
+                    "Model report",
+                    text.clone(),
+                    status == RunStatus::Completed,
+                );
+                run.finish(status, Some(text), error);
                 return Ok(());
             }
             if tool_calls.len() > 1 {
@@ -946,6 +1135,13 @@ fn advance_inner(handle: &RunHandle) -> Result<(), String> {
                 );
             }
             let call = tool_calls[0].clone();
+            run.actions_attempted += 1;
+            run.push_step(
+                "plan",
+                format!("Action proposed: {}", call.name),
+                "A registered tool call was generated by the Action model.",
+                true,
+            );
             let duplicate_key = format!(
                 "{}:{}",
                 call.name,
@@ -979,25 +1175,52 @@ fn advance_inner(handle: &RunHandle) -> Result<(), String> {
                         }));
                         Some(None)
                     }
-                    Ok(action) if action.requires_approval() => {
-                        let approval_id = format!("{}-{}", run.id, run.steps.len() + 1);
-                        run.push_step("approval", "Waiting for approval", action.summary(), true);
-                        run.pending = Some(PendingAction {
-                            approval_id,
-                            call,
-                            summary: action.summary(),
-                        });
-                        run.status = RunStatus::AwaitingApproval;
-                        return Ok(());
-                    }
                     Ok(action) => {
                         run.push_step(
                             "plan",
-                            format!("Next: {}", action.tool()),
-                            action.summary(),
+                            format!("Validated {}", action.tool()),
+                            "Arguments passed typed validation and safety checks.",
                             true,
                         );
-                        Some(Some(action))
+                        if run.safety == SafetyMode::ReadOnly && action.is_mutation() {
+                            let message = "Read-only safety mode rejected this mutation. No device change was made.";
+                            run.actions_blocked += 1;
+                            run.push_step(
+                                "plan",
+                                format!("Blocked {}", action.tool()),
+                                message,
+                                false,
+                            );
+                            run.messages.push(AiMessage::Tool(ToolResult {
+                                tool_call_id: call.id.clone(),
+                                name: call.name.clone(),
+                                content: message.to_string(),
+                            }));
+                            Some(None)
+                        } else if action.requires_approval(run.safety) {
+                            let approval_id = format!("{}-{}", run.id, run.steps.len() + 1);
+                            run.push_step(
+                                "approval",
+                                "Waiting for approval",
+                                action.summary(),
+                                true,
+                            );
+                            run.pending = Some(PendingAction {
+                                approval_id,
+                                call,
+                                summary: action.summary(),
+                            });
+                            run.status = RunStatus::AwaitingApproval;
+                            return Ok(());
+                        } else {
+                            run.push_step(
+                                "plan",
+                                format!("Next: {}", action.tool()),
+                                action.summary(),
+                                true,
+                            );
+                            Some(Some(action))
+                        }
                     }
                 }
             }
@@ -1026,9 +1249,25 @@ fn advance_inner(handle: &RunHandle) -> Result<(), String> {
             run.finish_cancelled();
             return Ok(());
         }
-        let title = format!("{}: {}", action.tool(), action.summary());
+        let title = format!("Executed: {} - {}", action.tool(), action.summary());
         run.push_step("action", title, outcome.detail.clone(), outcome.ok);
-        run.actions_run += 1;
+        run.record_action(&action, &outcome);
+        if action.is_readback() && outcome.ok {
+            run.push_step(
+                "observe",
+                "Device read-back returned",
+                "The observation succeeded; it does not by itself prove that the requested change occurred.",
+                true,
+            );
+        }
+        if outcome.verified {
+            run.push_step(
+                "verify",
+                "Intended device state verified",
+                outcome.detail.clone(),
+                true,
+            );
+        }
         let content = if outcome.ok {
             format!("ok: {}", outcome.detail)
         } else {
@@ -1071,6 +1310,7 @@ pub fn start(
     base_url: &str,
     model: &str,
     max_steps: Option<u32>,
+    safety: Option<&str>,
 ) -> Result<ActionTaskView, String> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -1098,6 +1338,7 @@ pub fn start(
     let max_steps = max_steps
         .unwrap_or(DEFAULT_MAX_STEPS)
         .clamp(1, HARD_MAX_STEPS);
+    let safety = SafetyMode::parse(safety.unwrap_or("confirm_mutations"))?;
     let id = format!(
         "action-{}-{}",
         now_seconds(),
@@ -1125,7 +1366,14 @@ pub fn start(
         started_at: now_seconds(),
         finished_at: None,
         steps_taken: 0,
+        actions_attempted: 0,
         actions_run: 0,
+        actions_failed: 0,
+        actions_blocked: 0,
+        mutations: 0,
+        verified_after_mutation: false,
+        readback_after_mutation: false,
+        safety,
         max_steps,
     };
     run.push_step(
@@ -1168,6 +1416,7 @@ pub fn approve(run_id: &str, approval_id: &str, approved: bool) -> Result<Action
             return Err("The approval reference does not match the pending action.".to_string());
         }
         if !approved {
+            run.actions_blocked += 1;
             run.push_step(
                 "approval",
                 "Action declined",
@@ -1194,11 +1443,27 @@ pub fn approve(run_id: &str, approval_id: &str, approved: bool) -> Result<Action
         let mut run = lock_run(&handle)?;
         run.push_step(
             "action",
-            format!("{}: {}", action.tool(), action.summary()),
+            format!("Executed: {} - {}", action.tool(), action.summary()),
             outcome.detail.clone(),
             outcome.ok,
         );
-        run.actions_run += 1;
+        run.record_action(&action, &outcome);
+        if action.is_readback() && outcome.ok {
+            run.push_step(
+                "observe",
+                "Device read-back returned",
+                "The observation succeeded; it does not by itself prove that the requested change occurred.",
+                true,
+            );
+        }
+        if outcome.verified {
+            run.push_step(
+                "verify",
+                "Intended device state verified",
+                outcome.detail.clone(),
+                true,
+            );
+        }
         run.messages.push(AiMessage::Tool(ToolResult {
             tool_call_id: call.id,
             name: call.name,
@@ -1358,10 +1623,35 @@ mod tests {
             json!({ "package": "org.example.app" }),
         ))
         .unwrap();
-        assert!(approved.requires_approval());
+        assert!(approved.requires_approval(SafetyMode::ConfirmMutations));
+        assert!(!approved.requires_approval(SafetyMode::ReadOnly));
         let tap = plan_call(&call("tap", json!({ "x": 1, "y": 1 }))).unwrap();
-        assert!(!tap.requires_approval());
+        assert!(tap.requires_approval(SafetyMode::ConfirmMutations));
+        assert!(tap.requires_approval(SafetyMode::ConfirmEveryAction));
+        assert!(tap.requires_approval(SafetyMode::TrustedLowRisk));
+        let volume_key = plan_call(&call("press_key", json!({ "key": "volume_down" }))).unwrap();
+        let power_key = plan_call(&call("press_key", json!({ "key": "power" }))).unwrap();
+        assert!(!volume_key.requires_approval(SafetyMode::TrustedLowRisk));
+        assert!(power_key.requires_approval(SafetyMode::TrustedLowRisk));
         assert!(approved.summary().contains("Uninstall org.example.app"));
+    }
+
+    #[test]
+    fn only_backend_confirmed_device_changes_count_as_verified() {
+        let launch =
+            plan_call(&call("launch_app", json!({ "package": "org.example.app" }))).unwrap();
+        let uninstall = plan_call(&call(
+            "uninstall_app",
+            json!({ "package": "org.example.app" }),
+        ))
+        .unwrap();
+        let tap = plan_call(&call("tap", json!({ "x": 1, "y": 1 }))).unwrap();
+
+        assert!(launch.is_verified_mutation());
+        assert!(uninstall.is_verified_mutation());
+        assert!(!tap.is_verified_mutation());
+        assert_eq!(SafetyMode::parse("read_only"), Ok(SafetyMode::ReadOnly));
+        assert!(SafetyMode::parse("unrecognized").is_err());
     }
 
     #[test]
@@ -1386,7 +1676,14 @@ mod tests {
             started_at: 0,
             finished_at: None,
             steps_taken: 6,
+            actions_attempted: 0,
             actions_run: 0,
+            actions_failed: 0,
+            actions_blocked: 0,
+            mutations: 0,
+            verified_after_mutation: false,
+            readback_after_mutation: false,
+            safety: SafetyMode::ConfirmMutations,
             max_steps: 6,
         };
         assert!(run.steps_taken >= run.max_steps);
@@ -1416,7 +1713,14 @@ mod tests {
             started_at: 0,
             finished_at: None,
             steps_taken: 0,
+            actions_attempted: 0,
             actions_run: 0,
+            actions_failed: 0,
+            actions_blocked: 0,
+            mutations: 0,
+            verified_after_mutation: false,
+            readback_after_mutation: false,
+            safety: SafetyMode::ConfirmMutations,
             max_steps: 6,
         };
         run.finish_cancelled();
@@ -1429,5 +1733,94 @@ mod tests {
         let truncated = truncate("x".repeat(MAX_TOOL_RESULT_CHARS + 100));
         assert!(truncated.chars().count() < MAX_TOOL_RESULT_CHARS + 100);
         assert!(truncated.contains("truncated"));
+    }
+
+    #[test]
+    fn successful_actions_require_a_verification_readback() {
+        let mut run = ActionRun {
+            id: "test-verification".to_string(),
+            prompt: "p".to_string(),
+            provider: providers::OLLAMA.to_string(),
+            base_url: providers::DEFAULT_OLLAMA_URL.to_string(),
+            model: "m".to_string(),
+            status: RunStatus::Running,
+            steps: Vec::new(),
+            messages: Vec::new(),
+            pending: None,
+            result: None,
+            error: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            runner_active: false,
+            seen: HashSet::new(),
+            started: Instant::now(),
+            started_at: 0,
+            finished_at: None,
+            steps_taken: 0,
+            actions_attempted: 1,
+            actions_run: 1,
+            actions_failed: 0,
+            actions_blocked: 0,
+            mutations: 1,
+            verified_after_mutation: false,
+            readback_after_mutation: false,
+            safety: SafetyMode::ConfirmMutations,
+            max_steps: 6,
+        };
+        let (status, error) = run.completion_status();
+        assert_eq!(status, RunStatus::NeedsVerification);
+        assert!(error.is_some());
+
+        run.readback_after_mutation = true;
+        let (status, error) = run.completion_status();
+        assert_eq!(status, RunStatus::NeedsVerification);
+        assert!(error.unwrap().contains("does not establish"));
+
+        run.verified_after_mutation = true;
+        let (status, error) = run.completion_status();
+        assert_eq!(status, RunStatus::Completed);
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn action_failures_do_not_claim_full_completion() {
+        let mut run = ActionRun {
+            id: "test-partial".to_string(),
+            prompt: "p".to_string(),
+            provider: providers::OLLAMA.to_string(),
+            base_url: providers::DEFAULT_OLLAMA_URL.to_string(),
+            model: "m".to_string(),
+            status: RunStatus::Running,
+            steps: Vec::new(),
+            messages: Vec::new(),
+            pending: None,
+            result: None,
+            error: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            runner_active: false,
+            seen: HashSet::new(),
+            started: Instant::now(),
+            started_at: 0,
+            finished_at: None,
+            steps_taken: 0,
+            actions_attempted: 2,
+            actions_run: 2,
+            actions_failed: 1,
+            actions_blocked: 0,
+            mutations: 1,
+            verified_after_mutation: true,
+            readback_after_mutation: false,
+            safety: SafetyMode::ConfirmMutations,
+            max_steps: 6,
+        };
+        let (status, error) = run.completion_status();
+        assert_eq!(status, RunStatus::PartiallyCompleted);
+        assert!(error.unwrap().contains("1 of 2"));
+
+        run.actions_run = 0;
+        run.actions_failed = 0;
+        run.actions_blocked = 1;
+        let (status, error) = run.completion_status();
+        assert_eq!(status, RunStatus::Failed);
+        assert!(error.unwrap().contains("read-only safety policy"));
     }
 }

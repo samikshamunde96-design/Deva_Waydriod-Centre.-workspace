@@ -14,6 +14,7 @@ fn live_action_loop_reports_tool_results_honestly() {
         providers::DEFAULT_OLLAMA_URL,
         &model,
         Some(3),
+        Some("read_only"),
     )
     .expect("action task started");
     println!("task {} status {}", task.id, task.status);

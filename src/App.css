@@ -1225,7 +1225,70 @@ select:disabled {
   background: rgba(239, 68, 68, 0.08);
 }
 
+.provider-health-grid,
+.action-history,
+.tool-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.provider-health-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.provider-health-heading h3 {
+  margin: 0;
+}
+
+.provider-health p {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+
+.health-error {
+  color: #fca5a5;
+}
+
+.action-history {
+  grid-template-columns: 1fr;
+}
+
+.action-history-item {
+  min-width: 0;
+}
+
+.history-title {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  font-weight: 700;
+  cursor: pointer;
+  padding: 0;
+}
+
+.tool-schema summary {
+  cursor: pointer;
+  padding: 10px 0;
+}
+
+.tool-list pre {
+  overflow: auto;
+  max-height: 240px;
+  white-space: pre-wrap;
+  color: #cbd5e1;
+}
+
 @media (max-width: 640px) {
+  .provider-health-grid,
+  .tool-list {
+    grid-template-columns: 1fr;
+  }
   .live-status,
   .log-list li {
     grid-template-columns: 1fr;
