@@ -2,9 +2,9 @@
 
 ## Unit tests
 
-`cargo test` runs only the pure-logic unit tests; the live integration test in
-`tests/live_host.rs` is marked `#[ignore]` and is therefore never executed by an
-ordinary test run. It covers:
+`cargo test` runs only the pure-logic unit tests; every file in `tests/` is
+marked `#[ignore]` and is therefore never executed by an ordinary test run. The
+unit tests cover:
 
 - health classification and container-state normalization
 - ADB device parsing, device selection and exact package membership
@@ -15,7 +15,10 @@ ordinary test run. It covers:
 - symlinked directory listing target
 - screenshot PNG validation, including truncated input
 - workflow step/report aggregation and unknown-workflow rejection
-- assistant model and message validation
+- provider request shaping, model-name/message validation and credential redaction
+- Action engine tool registry, typed argument validation, duplicate and
+  malformed-call rejection, step/deadline limits and cancellation
+- settings validation, atomic save and corrupt-file recovery
 - activity log ordering
 
 ## Manual verification against the live host
@@ -52,22 +55,33 @@ cd .. && npx tsc --noEmit && npm run build
 Tauri commands are `async` so multi-second ADB probes never block the webview
 event loop.
 
-## Live integration test (explicit opt-in only)
+## Live integration tests (explicit opt-in only)
 
-`src-tauri/tests/live_host.rs` drives a **real device**: it starts the Waydroid
-session, connects ADB, selects the device, taps, swipes, presses keys, uploads a
-file to `/sdcard/Download`, and queries a local Ollama service. It is therefore
-ignored by default and must never run in CI or in an ordinary `cargo test`.
+Every target in `src-tauri/tests/` drives a real resource and carries
+`#[ignore]`, so no ordinary `cargo test` can start Waydroid, inject input,
+upload files or modify Android state:
 
-Only run it deliberately, on a host where you accept that state change:
+- `live_host.rs` — starts the Waydroid session, connects ADB, selects the
+  device, taps, swipes, presses keys, uploads a file to `/sdcard/Download` and
+  queries a local Ollama service.
+- `live_action.rs` — runs the Action engine against a real local Ollama model.
+  It is restricted to allowlisted read tools, but those still read the real
+  device, so it is not a normal test either.
+- `live_provider.rs` — lists models and sends a chat turn to a local Ollama
+  service.
+
+Run one deliberately, on a host where you accept the state change:
 
 ```bash
-cd src-tauri && cargo test --test live_host -- --ignored
+cd src-tauri
+cargo test --test live_host -- --ignored      # starts Waydroid and injects input
+cargo test --test live_action -- --ignored    # needs `ollama serve`
+cargo test --test live_provider -- --ignored  # needs `ollama serve`
 ```
 
-A plain `cargo test` compiles the target but reports `0 passed; 0 failed;
-1 ignored` for it. Do not remove the `#[ignore]` attribute, and do not add a
-wrapper that runs ignored tests automatically.
+A plain `cargo test` or `cargo test --all-targets` compiles these targets but
+reports them as ignored. Never remove an `#[ignore]` attribute, never add a
+wrapper that runs ignored tests, and never pass `--include-ignored` in CI.
 
 ## What is explicitly not tested automatically
 

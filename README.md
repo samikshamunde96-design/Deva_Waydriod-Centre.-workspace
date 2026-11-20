@@ -27,7 +27,9 @@ every command succeeds.
   native dialogs, verified after the transfer
 - **Automation** — fixed, backend-validated workflows: bring-up, launch-and-verify,
   save a screenshot
-- **AI Assistant** — chat with a local Ollama model; no device tools
+- **AI** — two independent systems: *Chat* (conversation only) and *Action*
+  (a bounded agent that reaches the device through a fixed backend tool
+  registry, with approval for uninstalls)
 - **Device Settings** — display size and density overrides via Android `wm`
 - **Activity Logs** — in-memory outcome log for every backend action
 
@@ -55,6 +57,8 @@ npm run tauri dev
 - `Connect ADB` runs `adb connect` against the IP reported by `waydroid status`;
   ADB still has to be reconnected after every session restart unless
   `auto_adb = True` is set in `/var/lib/waydroid/waydroid.cfg`.
-- The AI Assistant needs a local Ollama service on `localhost:11434`
-  (`ollama serve`), reached through `curl`. It cannot run commands or change the
-  device.
+- Both AI systems need a reachable endpoint: `ollama` on `localhost:11434`
+  (`ollama serve`), or an OpenAI-compatible `/chat/completions` URL with a
+  session-only key. Chat and Action have separate provider/model settings; the
+  Action engine cannot run shell commands and refuses to report success without
+  a tool result that verifies it.

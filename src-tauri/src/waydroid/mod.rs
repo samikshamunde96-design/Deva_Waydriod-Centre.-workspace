@@ -24,6 +24,17 @@ const ANDROID_READY_TIMEOUT: Duration = Duration::from_secs(20);
 /// A fresh session reports `Session: RUNNING` before its network is up, so the
 /// ADB target only becomes available some seconds later.
 const ADB_TARGET_TIMEOUT: Duration = Duration::from_secs(45);
+/// A cold container often refuses the first connection and can sit at `offline`
+/// for tens of seconds after the session reports RUNNING, so the transport gets
+/// a window separate from the IP lookup.
+const ADB_TRANSPORT_TIMEOUT: Duration = Duration::from_secs(30);
+/// `adb connect` is idempotent, so it is re-issued while the transport is not
+/// yet `device` instead of failing the whole bring-up on one refused attempt.
+const ADB_RECONNECT_INTERVAL: Duration = Duration::from_secs(5);
+/// A 4K screenshot is well below this; the cap only rejects runaway frames.
+const MAX_SCREENSHOT_BYTES: usize = 32 * 1024 * 1024;
+/// 64 megapixels is above every supported Android display size.
+const MAX_SCREENSHOT_PIXELS: u64 = 64_000_000;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum DeviceHealth {
@@ -34,6 +45,7 @@ pub enum DeviceHealth {
     Unresponsive,
     AdbDisconnected,
     PermissionDenied,
+    NotInstalled,
     Unknown,
 }
 
@@ -47,8 +59,52 @@ impl DeviceHealth {
             DeviceHealth::Unresponsive => "Unresponsive",
             DeviceHealth::AdbDisconnected => "ADB disconnected",
             DeviceHealth::PermissionDenied => "Permission denied",
+            DeviceHealth::NotInstalled => "Waydroid not installed",
             DeviceHealth::Unknown => "Unknown",
         }
+    }
+}
+
+/// Health classification as a pure decision, so every state is reachable and
+/// testable without a live device.
+pub struct HealthInputs<'a> {
+    pub installed: bool,
+    pub session_running: bool,
+    pub container_status: &'a str,
+    pub selected_is_waydroid: bool,
+    pub adb_connected: bool,
+    pub adb_shell_healthy: bool,
+    pub package_manager_healthy: bool,
+}
+
+pub fn classify_health(inputs: &HealthInputs<'_>) -> DeviceHealth {
+    if !inputs.installed {
+        return DeviceHealth::NotInstalled;
+    }
+    if inputs.container_status == "PERMISSION UNAVAILABLE" {
+        return DeviceHealth::PermissionDenied;
+    }
+    if !inputs.session_running {
+        return DeviceHealth::Stopped;
+    }
+    if inputs.container_status == "FROZEN" {
+        return DeviceHealth::Frozen;
+    }
+    if inputs.container_status != "RUNNING" {
+        // The session reports RUNNING before the container finishes booting, or
+        // the container state could not be read reliably.
+        return DeviceHealth::Starting;
+    }
+    if !inputs.selected_is_waydroid {
+        return DeviceHealth::Unknown;
+    }
+    if !inputs.adb_connected {
+        return DeviceHealth::AdbDisconnected;
+    }
+    if inputs.adb_shell_healthy && inputs.package_manager_healthy {
+        DeviceHealth::Healthy
+    } else {
+        DeviceHealth::Unresponsive
     }
 }
 
@@ -139,18 +195,131 @@ pub fn waydroid_session_running() -> Result<bool, String> {
 
 static SESSION_PROCESS: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
 
-pub fn start_session() -> Result<String, String> {
+fn session_process() -> &'static Mutex<Option<Child>> {
+    SESSION_PROCESS.get_or_init(|| Mutex::new(None))
+}
+
+/// What a start request actually achieved. Only `SessionStart::Started` and
+/// `AlreadyRunning` claim that the session is up; a start that is still booting
+/// or blocked by permissions is never reported as success.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionStart {
+    AlreadyRunning,
+    Started,
+    StillStarting,
+    PermissionDenied,
+    Failed(String),
+}
+
+#[derive(Clone, Debug)]
+pub struct StartOutcome {
+    pub state: SessionStart,
+    pub message: String,
+    /// `None` means no device is selected, so readiness could not be checked.
+    pub android_ready: Option<bool>,
+}
+
+impl StartOutcome {
+    pub fn session_active(&self) -> bool {
+        matches!(
+            self.state,
+            SessionStart::AlreadyRunning | SessionStart::Started
+        )
+    }
+}
+
+fn classify_start_failure(container_state: &str) -> SessionStart {
+    if container_state == "PERMISSION UNAVAILABLE" {
+        SessionStart::PermissionDenied
+    } else {
+        SessionStart::Failed(
+            "Waydroid session process exited before the session became active.".to_string(),
+        )
+    }
+}
+
+/// Read-only readiness note for the selected device, used to keep the startup
+/// report honest. It never resumes a frozen container by itself.
+fn readiness_note() -> (Option<bool>, String) {
+    let Ok(device) = crate::android::get_selected_device() else {
+        return (
+            None,
+            " No device is selected, so Android readiness was not verified.".to_string(),
+        );
+    };
+    match WaydroidPowerManager::new().ensure_android_ready_readonly(&device) {
+        Ok(_) => (
+            Some(true),
+            " Android readiness is verified on the selected device.".to_string(),
+        ),
+        Err(error) => (
+            Some(false),
+            format!(" Android readiness is not verified yet: {error}"),
+        ),
+    }
+}
+
+pub fn start_session() -> Result<StartOutcome, String> {
     if waydroid_session_running()? {
-        return Ok("Waydroid session is already running.".to_string());
+        let (ready, note) = readiness_note();
+        return Ok(StartOutcome {
+            state: SessionStart::AlreadyRunning,
+            message: format!("Waydroid session is already running.{note}"),
+            android_ready: ready,
+        });
     }
 
-    let process_lock = SESSION_PROCESS.get_or_init(|| Mutex::new(None));
-    let mut process = process_lock
+    spawn_session_process()?;
+    let deadline = Instant::now() + Duration::from_secs(25);
+    while Instant::now() < deadline {
+        if waydroid_session_running()? {
+            let (ready, note) = readiness_note();
+            return Ok(StartOutcome {
+                state: SessionStart::Started,
+                message: format!("Waydroid session started.{note}"),
+                android_ready: ready,
+            });
+        }
+        if let Some(state) = reap_session_process()? {
+            let container = container_state().unwrap_or_else(|_| "Unknown".to_string());
+            let state = match state {
+                SessionStart::Started => classify_start_failure(&container),
+                other => other,
+            };
+            return Ok(StartOutcome {
+                state: state.clone(),
+                message: match &state {
+                    SessionStart::PermissionDenied => {
+                        "Waydroid session could not start: the container manager denied the request. Check that waydroid-container.service is running and that your user is allowed to use Waydroid.".to_string()
+                    }
+                    SessionStart::Failed(error) => error.clone(),
+                    _ => "Waydroid session start finished.".to_string(),
+                },
+                android_ready: Some(false),
+            });
+        }
+        thread::sleep(Duration::from_millis(500));
+    }
+    Ok(StartOutcome {
+        state: SessionStart::StillStarting,
+        message: "Waydroid is still starting after 25s; the session process was left running. Retry in a few seconds.".to_string(),
+        android_ready: Some(false),
+    })
+}
+
+/// Spawns `waydroid session start` unless an earlier child is still running.
+fn spawn_session_process() -> Result<(), String> {
+    let mut process = session_process()
         .lock()
         .map_err(|_| "Waydroid session process state is unavailable.".to_string())?;
     if let Some(child) = process.as_mut() {
         match child.try_wait() {
-            Ok(None) => return Ok("Waydroid session startup is still in progress.".to_string()),
+            Ok(None) => {
+                return Err(
+                    "A Waydroid session start is already in progress; wait for it to finish."
+                        .to_string(),
+                );
+            }
             Ok(Some(_)) => *process = None,
             Err(error) => {
                 return Err(format!(
@@ -168,32 +337,42 @@ pub fn start_session() -> Result<String, String> {
             .spawn()
             .map_err(|err| format!("failed to start Waydroid session: {err}"))?,
     );
+    Ok(())
+}
 
-    let deadline = Instant::now() + Duration::from_secs(25);
-    while Instant::now() < deadline {
-        if waydroid_session_running()? {
-            return Ok("Waydroid session started.".to_string());
+/// Returns the terminal state of the session child, if it has exited.
+fn reap_session_process() -> Result<Option<SessionStart>, String> {
+    let mut process = session_process()
+        .lock()
+        .map_err(|_| "Waydroid session process state is unavailable.".to_string())?;
+    let Some(child) = process.as_mut() else {
+        return Ok(None);
+    };
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            *process = None;
+            Ok(Some(if status.success() {
+                SessionStart::Started
+            } else {
+                SessionStart::Failed(
+                    "Waydroid session process exited before the session became active.".to_string(),
+                )
+            }))
         }
-        if let Some(child) = process.as_mut() {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    *process = None;
-                    return Err(
-                        "Waydroid session process exited before the session became active."
-                            .to_string(),
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    return Err(format!(
-                        "could not inspect Waydroid session process: {error}"
-                    ));
-                }
-            }
-        }
-        thread::sleep(Duration::from_millis(500));
+        Ok(None) => Ok(None),
+        Err(error) => Err(format!(
+            "could not inspect Waydroid session process: {error}"
+        )),
     }
-    Ok("Waydroid startup is still in progress; the session process was left running.".to_string())
+}
+
+pub fn require_stop_approval(approved: bool) -> Result<(), String> {
+    if approved {
+        Ok(())
+    } else {
+        Err("Stopping Waydroid requires explicit confirmation because it closes the Android session."
+            .to_string())
+    }
 }
 
 pub fn stop_session() -> Result<String, String> {
@@ -204,8 +383,7 @@ pub fn stop_session() -> Result<String, String> {
         );
     }
 
-    let process_lock = SESSION_PROCESS.get_or_init(|| Mutex::new(None));
-    let mut process = process_lock
+    let mut process = session_process()
         .lock()
         .map_err(|_| "Waydroid session process state is unavailable.".to_string())?;
     if let Some(child) = process.as_mut() {
@@ -251,23 +429,19 @@ pub fn connect_waydroid_adb() -> Result<String, String> {
         );
     }
     let target = wait_for_adb_target()?;
-    if let Ok(devices) = detect_adb_devices()
-        && devices
-            .iter()
-            .any(|device| device.serial == target && device.state == "device")
-    {
+    if find_adb_device(&target)?.is_some_and(|device| device.state == "device") {
         return Ok(format!("ADB is already connected to {target}."));
     }
-    run_command("adb", &["connect", &target], 10)?;
-    // `adb connect` returns before the transport is registered, so the device
-    // appears in `adb devices` a moment later.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut last_state;
+    let mut wait = TransportWait::new(
+        Instant::now(),
+        ADB_TRANSPORT_TIMEOUT,
+        ADB_RECONNECT_INTERVAL,
+    );
+    // A refused connect is common while the container is still booting, so the
+    // error is kept for diagnostics instead of aborting the attempt.
+    wait.record_connect(run_command("adb", &["connect", &target], 10).err());
     loop {
-        match detect_adb_devices()?
-            .into_iter()
-            .find(|device| device.serial == target)
-        {
+        match find_adb_device(&target)? {
             Some(device) if device.state == "device" => {
                 return Ok(format!(
                     "ADB connected to {} ({target}).",
@@ -278,16 +452,86 @@ pub fn connect_waydroid_adb() -> Result<String, String> {
                     }
                 ));
             }
-            Some(device) => last_state = Some(device.state),
-            None => last_state = None,
+            Some(device) => wait.observe(Some(&device.state)),
+            None => wait.observe(None),
         }
-        if Instant::now() >= deadline {
-            let state = last_state.as_deref().unwrap_or("not listed");
-            return Err(format!(
-                "ADB reached {target}, but its state is {state} after 10s."
-            ));
+        let now = Instant::now();
+        if wait.timed_out(now) {
+            return Err(wait.timeout_message(&target));
+        }
+        if wait.should_reconnect(now) {
+            wait.record_connect(run_command("adb", &["connect", &target], 5).err());
         }
         thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// One `adb devices -l` lookup; `None` means the serial is not listed yet.
+fn find_adb_device(target: &str) -> Result<Option<DeviceSelection>, String> {
+    Ok(detect_adb_devices()?
+        .into_iter()
+        .find(|device| device.serial == target))
+}
+
+/// Tracks the transport wait so the retry policy is testable without a device:
+/// distinct observed states in first-seen order, the reconnect cadence, and the
+/// last `adb connect` error.
+struct TransportWait {
+    deadline: Instant,
+    next_reconnect: Instant,
+    reconnect_interval: Duration,
+    states: Vec<String>,
+    last_connect_error: Option<String>,
+}
+
+impl TransportWait {
+    fn new(now: Instant, timeout: Duration, reconnect_interval: Duration) -> Self {
+        Self {
+            deadline: now + timeout,
+            next_reconnect: now + reconnect_interval,
+            reconnect_interval,
+            states: Vec::new(),
+            last_connect_error: None,
+        }
+    }
+
+    fn observe(&mut self, state: Option<&str>) {
+        let label = state.unwrap_or("not listed");
+        if !self.states.iter().any(|seen| seen == label) {
+            self.states.push(label.to_string());
+        }
+    }
+
+    /// A later successful `adb connect` clears the error. A failed one replaces
+    /// it, so the timeout message always describes the most recent attempt.
+    fn record_connect(&mut self, result: Option<String>) {
+        self.last_connect_error = result;
+        self.next_reconnect = Instant::now() + self.reconnect_interval;
+    }
+
+    fn should_reconnect(&self, now: Instant) -> bool {
+        now >= self.next_reconnect
+    }
+
+    fn timed_out(&self, now: Instant) -> bool {
+        now >= self.deadline
+    }
+
+    fn timeout_message(&self, target: &str) -> String {
+        let connect_error = self
+            .last_connect_error
+            .as_deref()
+            .map(|error| format!(" Last `adb connect` error: {error}."))
+            .unwrap_or_default();
+        let observed = if self.states.is_empty() {
+            "no transport state observed".to_string()
+        } else {
+            self.states.join(" -> ")
+        };
+        format!(
+            "ADB target {target} did not reach the `device` state within {}s (observed: {observed}).{connect_error} Retry Connect ADB once Waydroid has finished booting.",
+            ADB_TRANSPORT_TIMEOUT.as_secs(),
+        )
     }
 }
 
@@ -334,13 +578,28 @@ fn normalize_container_state(result: Result<String, String>) -> Result<String, S
 }
 
 pub(crate) fn decode_screenshot_png(bytes: &[u8]) -> Result<(u32, u32), String> {
+    decode_screenshot_png_limited(bytes, MAX_SCREENSHOT_BYTES)
+}
+
+/// Screenshots are decoded fully to prove they are real PNGs; a byte cap keeps
+/// a malformed or oversized frame from allocating unbounded memory.
+pub(crate) fn decode_screenshot_png_limited(
+    bytes: &[u8],
+    max_bytes: usize,
+) -> Result<(u32, u32), String> {
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "Screenshot is larger than the supported {} MiB limit.",
+            max_bytes / (1024 * 1024)
+        ));
+    }
     let decoder = png::Decoder::new(Cursor::new(bytes));
     let mut reader = decoder
         .read_info()
         .map_err(|error| format!("Screenshot is not a valid PNG: {error}"))?;
     let info = reader.info();
     let pixels = u64::from(info.width) * u64::from(info.height);
-    if info.width == 0 || info.height == 0 || pixels > 64_000_000 {
+    if info.width == 0 || info.height == 0 || pixels > MAX_SCREENSHOT_PIXELS {
         return Err(format!(
             "Screenshot dimensions are unsupported: {}x{}.",
             info.width, info.height
@@ -356,6 +615,16 @@ pub(crate) fn decode_screenshot_png(bytes: &[u8]) -> Result<(u32, u32), String> 
         .next_frame(&mut decoded)
         .map_err(|error| format!("Screenshot PNG could not be fully decoded: {error}"))?;
     Ok((frame.width, frame.height))
+}
+
+/// Whether an ordinary (read-only) readiness check must take the exclusive
+/// power lock because the container has to be resumed first.
+fn readiness_requires_power(
+    session_is_running: bool,
+    state: &str,
+    suspend_action: &str,
+) -> Result<bool, String> {
+    resume_required(session_is_running, state, suspend_action)
 }
 
 fn resume_required(
@@ -386,6 +655,16 @@ fn resume_required(
 fn ensure_not_cancelled() -> Result<(), String> {
     if POWER_CANCELLED.load(Ordering::Acquire) {
         Err("Android operation cancelled before the next step.".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+/// Read-only operations must not observe a cancellation flag left over from an
+/// earlier power operation.
+fn ensure_not_cancelled_if_active() -> Result<(), String> {
+    if POWER_ACTIVE.load(Ordering::Acquire) {
+        ensure_not_cancelled()
     } else {
         Ok(())
     }
@@ -431,6 +710,7 @@ fn end_power_operation(result: &Result<String, String>) {
         Err(error) => format!("Failed: {error}"),
     };
     let _ = set_power_progress(message);
+    POWER_CANCELLED.store(false, Ordering::Release);
     POWER_ACTIVE.store(false, Ordering::Release);
 }
 
@@ -449,39 +729,62 @@ impl WaydroidPowerManager {
 
     pub fn ensure_android_ready(&self, device: &DeviceSelection) -> Result<String, String> {
         begin_power_operation()?;
-        let result = self.ensure_android_ready_inner(device);
+        let result = (|| {
+            let resumed = self.resume_if_needed(device)?;
+            self.probe_android_ready(device, resumed)
+        })();
         end_power_operation(&result);
         result
     }
 
-    fn ensure_android_ready_inner(&self, device: &DeviceSelection) -> Result<String, String> {
-        ensure_not_cancelled()?;
+    /// Read-only readiness check used by ordinary Android operations. It takes
+    /// the exclusive power lock only when a frozen container really needs a
+    /// resume, so two read-only commands never fail with "another power
+    /// operation is active".
+    pub fn ensure_android_ready_readonly(
+        &self,
+        device: &DeviceSelection,
+    ) -> Result<String, String> {
         verify_device_connected(device)?;
-        if device.is_waydroid {
-            let running = waydroid_session_running()?;
-            let state = container_state()?;
-            let suspend_action = read_suspend_action()?;
-            if resume_required(running, &state, &suspend_action)? {
-                set_power_progress("Resuming frozen Waydroid container through ContainerManager…")?;
-                ensure_not_cancelled()?;
-                let mut args = CONTAINER_BUS.to_vec();
-                args.push("Unfreeze");
-                run_command("busctl", &args, 8)?;
-                set_power_progress("Waiting for Waydroid container and Android to respond…")?;
-            } else {
-                set_power_progress("Waydroid is running; checking Android responsiveness…")?;
-            }
-        } else {
-            set_power_progress(format!(
-                "Checking selected Android device {}…",
-                device.serial
-            ))?;
+        if self.needs_resume(device)? {
+            return self.ensure_android_ready(device);
         }
+        self.probe_android_ready(device, false)
+    }
 
+    fn needs_resume(&self, device: &DeviceSelection) -> Result<bool, String> {
+        if !device.is_waydroid {
+            return Ok(false);
+        }
+        let running = waydroid_session_running()?;
+        let state = container_state()?;
+        let suspend_action = read_suspend_action()?;
+        readiness_requires_power(running, &state, &suspend_action)
+    }
+
+    fn resume_if_needed(&self, device: &DeviceSelection) -> Result<bool, String> {
+        if !self.needs_resume(device)? {
+            set_power_progress("Waydroid is running; checking Android responsiveness…")?;
+            return Ok(false);
+        }
+        set_power_progress("Resuming frozen Waydroid container through ContainerManager…")?;
+        ensure_not_cancelled()?;
+        let mut args = CONTAINER_BUS.to_vec();
+        args.push("Unfreeze");
+        run_command("busctl", &args, 8)?;
+        set_power_progress("Waiting for Waydroid container and Android to respond…")?;
+        Ok(true)
+    }
+
+    fn probe_android_ready(
+        &self,
+        device: &DeviceSelection,
+        resumed: bool,
+    ) -> Result<String, String> {
         let deadline = Instant::now() + ANDROID_READY_TIMEOUT;
         let mut last_error = "Android shell has not responded yet.".to_string();
         while Instant::now() < deadline {
-            ensure_not_cancelled()?;
+            ensure_not_cancelled_if_active()?;
             verify_device_connected(device)?;
             if device.is_waydroid {
                 let state = container_state()?;
@@ -490,7 +793,7 @@ impl WaydroidPowerManager {
             match adb_command_timeout(&device.serial, &["shell", "echo", "wcc-ready"], 4) {
                 Ok(output) if output.trim() == "wcc-ready" => {
                     set_power_progress("Android shell responded; checking package manager…")?;
-                    ensure_not_cancelled()?;
+                    ensure_not_cancelled_if_active()?;
                     if let Err(error) =
                         adb_command_timeout(&device.serial, &["shell", "pm", "path", "android"], 6)
                     {
@@ -499,8 +802,9 @@ impl WaydroidPowerManager {
                         break;
                     }
                     return Ok(format!(
-                        "Android shell and package manager are responsive on selected device {}.",
-                        device.serial
+                        "Android shell and package manager are responsive on selected device {}{}.",
+                        device.serial,
+                        if resumed { " (after resume)" } else { "" }
                     ));
                 }
                 Ok(_) => last_error = "Android shell returned an unexpected response.".to_string(),
@@ -573,11 +877,15 @@ impl WaydroidPowerManager {
 }
 
 pub fn detect_waydroid(selected: Option<&DeviceSelection>) -> WaydroidDiagnostics {
-    let installed = command_ok("waydroid", &["--version"]);
+    // One invocation decides both installation and version: probing
+    // `waydroid --version` twice doubled the dashboard cost.
+    let version_output = run_command("waydroid", &["--version"], 8);
+    let installed = version_output.is_ok();
     let mut diagnostics = WaydroidDiagnostics {
         installed,
         service_running: false,
-        version: String::new(),
+        version: version_output.unwrap_or_default(),
+
         session_running: false,
         container_status: "Unknown".to_string(),
         suspend_action: "Unknown".to_string(),
@@ -609,9 +917,6 @@ pub fn detect_waydroid(selected: Option<&DeviceSelection>) -> WaydroidDiagnostic
             "systemctl",
             &["is-active", "--quiet", "waydroid-container.service"],
         );
-        if let Ok(version) = run_command("waydroid", &["--version"], 8) {
-            diagnostics.version = version;
-        }
         match read_suspend_action() {
             Ok(action) => diagnostics.suspend_action = action,
             Err(error) => diagnostics.probe_errors.push(error),
@@ -732,19 +1037,17 @@ pub fn detect_waydroid(selected: Option<&DeviceSelection>) -> WaydroidDiagnostic
         }
     }
 
-    diagnostics.health = if !diagnostics.installed || !diagnostics.session_running {
-        DeviceHealth::Stopped.as_str().to_string()
-    } else if diagnostics.container_status == "FROZEN" {
-        DeviceHealth::Frozen.as_str().to_string()
-    } else if !selected.is_some_and(|device| device.is_waydroid) {
-        DeviceHealth::Unknown.as_str().to_string()
-    } else if !diagnostics.adb_connected {
-        DeviceHealth::AdbDisconnected.as_str().to_string()
-    } else if diagnostics.adb_shell_healthy && diagnostics.android_package_manager_healthy {
-        DeviceHealth::Healthy.as_str().to_string()
-    } else {
-        DeviceHealth::Unresponsive.as_str().to_string()
-    };
+    diagnostics.health = classify_health(&HealthInputs {
+        installed: diagnostics.installed,
+        session_running: diagnostics.session_running,
+        container_status: &diagnostics.container_status,
+        selected_is_waydroid: selected.is_some_and(|device| device.is_waydroid),
+        adb_connected: diagnostics.adb_connected,
+        adb_shell_healthy: diagnostics.adb_shell_healthy,
+        package_manager_healthy: diagnostics.android_package_manager_healthy,
+    })
+    .as_str()
+    .to_string();
 
     diagnostics
 }
@@ -807,6 +1110,12 @@ pub fn require_restart_approval(approved: bool) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Tests below mutate process-wide power flags, so they must not interleave.
+    fn test_state_lock() -> &'static Mutex<()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        &LOCK
+    }
+
     #[test]
     fn health_states_are_mapped() {
         assert_eq!(DeviceHealth::Healthy.as_str(), "Healthy");
@@ -850,6 +1159,9 @@ mod tests {
 
     #[test]
     fn cancellation_is_checked_before_the_next_operation() {
+        let _serial = test_state_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         POWER_CANCELLED.store(true, Ordering::Release);
         assert!(ensure_not_cancelled().is_err());
         POWER_CANCELLED.store(false, Ordering::Release);
@@ -878,6 +1190,154 @@ mod tests {
             Some("RUNNING".to_string())
         );
         assert_eq!(container_state_from_status("Session:\tSTOPPED\n"), None);
+    }
+
+    #[test]
+    fn transport_state_history_keeps_distinct_states_in_first_seen_order() {
+        let mut wait = TransportWait::new(
+            Instant::now(),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        );
+        wait.observe(None);
+        wait.observe(Some("offline"));
+        wait.observe(Some("offline"));
+        wait.observe(Some("device"));
+        wait.observe(None);
+        assert_eq!(wait.states, vec!["not listed", "offline", "device"]);
+    }
+
+    #[test]
+    fn transport_reconnects_on_the_interval_and_stops_at_the_deadline() {
+        let start = Instant::now();
+        let wait = TransportWait::new(start, Duration::from_secs(30), Duration::from_secs(5));
+        assert!(!wait.should_reconnect(start + Duration::from_millis(4999)));
+        assert!(wait.should_reconnect(start + Duration::from_secs(5)));
+        assert!(!wait.timed_out(start + Duration::from_millis(29_999)));
+        assert!(wait.timed_out(start + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn transport_timeout_message_reports_the_path_and_the_last_connect_error() {
+        let start = Instant::now();
+        let mut wait = TransportWait::new(start, Duration::from_secs(30), Duration::from_secs(5));
+        wait.observe(None);
+        wait.observe(Some("offline"));
+        wait.record_connect(Some("connection refused".to_string()));
+        let message = wait.timeout_message("192.168.240.2:5555");
+        assert!(message.contains("not listed -> offline"));
+        assert!(message.contains("connection refused"));
+        assert!(message.contains("30s"));
+
+        wait.record_connect(None);
+        assert!(
+            !wait
+                .timeout_message("192.168.240.2:5555")
+                .contains("adb connect")
+        );
+    }
+
+    #[test]
+    fn transport_state_becoming_device_is_an_immediate_success_path() {
+        let mut wait = TransportWait::new(
+            Instant::now(),
+            Duration::from_secs(30),
+            Duration::from_secs(5),
+        );
+        wait.observe(Some("offline"));
+        wait.observe(Some("device"));
+        assert_eq!(wait.states.last().map(String::as_str), Some("device"));
+    }
+
+    #[test]
+    fn every_health_state_is_reachable() {
+        let base = HealthInputs {
+            installed: true,
+            session_running: true,
+            container_status: "RUNNING",
+            selected_is_waydroid: true,
+            adb_connected: true,
+            adb_shell_healthy: true,
+            package_manager_healthy: true,
+        };
+        assert_eq!(
+            classify_health(&HealthInputs {
+                installed: false,
+                ..base
+            }),
+            DeviceHealth::NotInstalled
+        );
+
+        let mut inputs = HealthInputs { ..base };
+        inputs.container_status = "PERMISSION UNAVAILABLE";
+        assert_eq!(classify_health(&inputs), DeviceHealth::PermissionDenied);
+
+        let mut inputs = HealthInputs { ..base };
+        inputs.session_running = false;
+        assert_eq!(classify_health(&inputs), DeviceHealth::Stopped);
+
+        let mut inputs = HealthInputs { ..base };
+        inputs.container_status = "FROZEN";
+        assert_eq!(classify_health(&inputs), DeviceHealth::Frozen);
+
+        let mut inputs = HealthInputs { ..base };
+        inputs.container_status = "UNKNOWN";
+        assert_eq!(classify_health(&inputs), DeviceHealth::Starting);
+
+        let mut inputs = HealthInputs { ..base };
+        inputs.selected_is_waydroid = false;
+        assert_eq!(classify_health(&inputs), DeviceHealth::Unknown);
+
+        let mut inputs = HealthInputs { ..base };
+        inputs.adb_connected = false;
+        assert_eq!(classify_health(&inputs), DeviceHealth::AdbDisconnected);
+
+        let mut inputs = HealthInputs { ..base };
+        inputs.adb_shell_healthy = false;
+        assert_eq!(classify_health(&inputs), DeviceHealth::Unresponsive);
+
+        assert_eq!(classify_health(&base), DeviceHealth::Healthy);
+    }
+
+    #[test]
+    fn start_failures_are_classified_as_permission_denied_only_when_the_container_reports_it() {
+        assert_eq!(
+            classify_start_failure("PERMISSION UNAVAILABLE"),
+            SessionStart::PermissionDenied
+        );
+        assert!(matches!(
+            classify_start_failure("STOPPED"),
+            SessionStart::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn read_only_readiness_never_waits_for_the_power_lock() {
+        let _serial = test_state_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        begin_power_operation().expect("power operation");
+        // A running, unfrozen session means the read-only path has nothing to
+        // mutate, so it must not attempt the exclusive lock.
+        assert_eq!(
+            readiness_requires_power(true, "RUNNING", "freeze"),
+            Ok(false)
+        );
+        assert!(begin_power_operation().is_err());
+        end_power_operation(&Ok("finished".to_string()));
+        assert!(!POWER_ACTIVE.load(Ordering::Acquire));
+        assert!(!POWER_CANCELLED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn cancellation_flags_do_not_leak_into_later_read_only_operations() {
+        let _serial = test_state_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        begin_power_operation().unwrap();
+        POWER_CANCELLED.store(true, Ordering::Release);
+        end_power_operation(&Err("cancelled".to_string()));
+        assert!(ensure_not_cancelled_if_active().is_ok());
     }
 
     #[test]

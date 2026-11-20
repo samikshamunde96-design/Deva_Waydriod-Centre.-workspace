@@ -1,6 +1,9 @@
 pub mod activity;
+pub mod agent;
 pub mod android;
-pub mod assistant;
+pub mod http;
+pub mod providers;
+pub mod settings;
 pub mod waydroid;
 pub mod workflow;
 
@@ -8,18 +11,30 @@ use serde::{Deserialize, Serialize};
 
 use crate::activity::LogEntry;
 use crate::android::{
-    AndroidFileEntry, ApkFileInfo, AppEntry, AppInfo, DeviceSelection, DisplayInfo, adb_command,
-    apply_display, begin_selected_device_operation, choose_apk_file, choose_upload_file,
-    display_info, get_app_info, get_foreground_app, get_selected_device, inspect_apk, install_apk,
-    is_app_installed, launch_app, list_adb_devices, list_android_files,
-    list_installed_apps_selected, press_key, pull_file_from_android, push_file_to_android,
-    reset_display, screenshot_base64, set_selected_device, swipe, tap, uninstall_app,
+    AndroidFileEntry, ApkFileInfo, AppEntry, AppInfo, DeviceSelection, DisplayInfo, apply_display,
+    begin_selected_device_operation, choose_apk_file, choose_upload_file, display_info,
+    get_app_info, get_foreground_app, get_selected_device, inspect_apk, install_apk, launch_app,
+    list_adb_devices, list_android_files, list_installed_apps_selected, press_key,
+    pull_file_from_android, push_file_to_android, reset_display, screenshot_base64,
+    set_selected_device, swipe, tap, uninstall_app,
 };
-use crate::assistant::ChatMessage;
+use crate::providers::{ChatMessage, ChatReply};
 use crate::waydroid::{
     WaydroidPowerManager, detect_waydroid, power_operation_progress, require_restart_approval,
-    run_command, start_session, stop_session,
+    require_stop_approval, run_command, start_session, stop_session,
 };
+
+/// Runs blocking provider/ADB work off the Tauri runtime so long operations do
+/// not stall unrelated commands.
+async fn blocking<T, F>(work: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|error| format!("The background task failed: {error}"))?
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DashboardStatus {
@@ -43,25 +58,13 @@ pub struct DashboardStatus {
     pub cpu_usage: String,
     pub memory_usage: String,
     pub storage_usage: String,
-    pub app_count: Option<usize>,
     pub ip_address: String,
     pub session_user: String,
     pub wayland_display: String,
     pub vendor_type: String,
     pub last_operation: String,
-    pub automation_status: String,
     pub power_progress: String,
     pub probe_errors: Vec<String>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct DeviceDetails {
-    pub health: String,
-    pub android_version: String,
-    pub device_name: String,
-    pub dimensions: String,
-    pub density: String,
-    pub details: String,
 }
 
 fn read_system_value(program: &str, args: &[&str]) -> String {
@@ -129,35 +132,14 @@ async fn get_dashboard_status() -> Result<DashboardStatus, String> {
             }
             None => String::from("Unavailable"),
         },
-        app_count: None,
         ip_address: diagnostics.ip_address,
         session_user: diagnostics.session_user,
         wayland_display: diagnostics.wayland_display,
         vendor_type: diagnostics.vendor_type,
         last_operation: activity::last_summary()
             .unwrap_or_else(|| format!("Health: {}", diagnostics.health)),
-        automation_status: String::from("Idle"),
         power_progress: power_operation_progress()?,
         probe_errors: diagnostics.probe_errors,
-    })
-}
-
-#[tauri::command]
-async fn get_device_details() -> Result<DeviceDetails, String> {
-    let (_operation, selected_device) = begin_selected_device_operation()?;
-    WaydroidPowerManager::new().ensure_android_ready(&selected_device)?;
-    let diagnostics = detect_waydroid(Some(&selected_device));
-    let dimensions = adb_command(&selected_device.serial, &["shell", "wm", "size"])?;
-    let density = adb_command(&selected_device.serial, &["shell", "wm", "density"])?;
-    let details = adb_command(&selected_device.serial, &["shell", "getprop"])?;
-
-    Ok(DeviceDetails {
-        health: diagnostics.health,
-        android_version: diagnostics.android_version,
-        device_name: diagnostics.device_name,
-        dimensions,
-        density,
-        details,
     })
 }
 
@@ -212,15 +194,6 @@ async fn launch_android_app(package_name: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn is_android_app_installed(package_name: String) -> Result<bool, String> {
-    if package_name.trim().is_empty() {
-        return Err("Package name is required.".to_string());
-    }
-    let selected = get_selected_device()?;
-    is_app_installed(&selected.serial, &package_name)
-}
-
-#[tauri::command]
 async fn get_android_foreground_app() -> Result<String, String> {
     let selected = get_selected_device()?;
     get_foreground_app(&selected.serial)
@@ -252,16 +225,31 @@ async fn uninstall_android_app(package_name: String, approved: bool) -> Result<S
     result
 }
 
+/// A start that is only "still booting" or was denied is reported as an error,
+/// so the UI never shows a successful start for a session that is not up.
 #[tauri::command]
 async fn start_waydroid() -> Result<String, String> {
-    let result = start_session();
-    activity::record_message("Start Waydroid session", &result);
+    let result = blocking(|| {
+        start_session().map(|outcome| {
+            if outcome.session_active() {
+                Ok(outcome.message)
+            } else {
+                Err(outcome.message)
+            }
+        })?
+    })
+    .await;
+    activity::record_outcome("Start Waydroid session", &result);
     result
 }
 
 #[tauri::command]
-async fn stop_waydroid() -> Result<String, String> {
-    let result = stop_session();
+async fn stop_waydroid(approved: bool) -> Result<String, String> {
+    let result = blocking(move || {
+        require_stop_approval(approved)?;
+        stop_session()
+    })
+    .await;
     activity::record_message("Stop Waydroid session", &result);
     result
 }
@@ -269,10 +257,17 @@ async fn stop_waydroid() -> Result<String, String> {
 #[tauri::command]
 async fn restart_waydroid(approved: bool) -> Result<String, String> {
     require_restart_approval(approved)?;
-    let result = (|| {
+    let result = blocking(|| {
         stop_session()?;
-        start_session()
-    })();
+        start_session().and_then(|outcome| {
+            if outcome.session_active() {
+                Ok(outcome.message)
+            } else {
+                Err(outcome.message)
+            }
+        })
+    })
+    .await;
     activity::record_message("Restart Waydroid session", &result);
     result
 }
@@ -414,19 +409,137 @@ async fn get_activity_log() -> Result<Vec<LogEntry>, String> {
     Ok(activity::entries())
 }
 
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
 #[tauri::command]
-async fn list_ollama_models() -> Result<Vec<String>, String> {
-    assistant::list_models()
+async fn load_settings() -> Result<settings::SettingsLoad, String> {
+    Ok(settings::load())
 }
 
 #[tauri::command]
-async fn ask_ollama(model: String, messages: Vec<ChatMessage>) -> Result<String, String> {
-    let result = assistant::chat(&model, &messages);
-    match &result {
-        Ok(_) => activity::record("info", "Local assistant query", format!("model {model}")),
-        Err(error) => activity::record("error", "Local assistant query", error.clone()),
+async fn save_settings(next: settings::Settings) -> Result<settings::Settings, String> {
+    let saved = settings::save(&next)?;
+    activity::record("info", "Save settings", "preferences updated");
+    Ok(saved)
+}
+
+// ---------------------------------------------------------------------------
+// AI providers
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn provider_health(
+    provider: String,
+    base_url: String,
+) -> Result<providers::ProviderHealth, String> {
+    blocking(move || Ok(providers::health(&provider, &base_url))).await
+}
+
+#[tauri::command]
+async fn list_provider_models(
+    provider: String,
+    base_url: String,
+) -> Result<Vec<providers::ModelMetadata>, String> {
+    blocking(move || providers::list_models(&provider, &base_url)).await
+}
+
+#[tauri::command]
+async fn probe_provider_model(
+    provider: String,
+    base_url: String,
+    model: String,
+) -> Result<providers::ModelCapabilities, String> {
+    blocking(move || providers::probe_model(&provider, &base_url, &model)).await
+}
+
+/// The key is stored in process memory only; it is never persisted or returned.
+#[tauri::command]
+async fn set_provider_credential(provider: String, secret: String) -> Result<bool, String> {
+    providers::set_credential(&provider, &secret)?;
+    activity::record(
+        "info",
+        "AI credential",
+        format!("configured for {provider} (session only)"),
+    );
+    Ok(true)
+}
+
+#[tauri::command]
+async fn clear_provider_credential(provider: String) -> Result<bool, String> {
+    providers::clear_credential(&provider)?;
+    activity::record("info", "AI credential", format!("cleared for {provider}"));
+    Ok(false)
+}
+
+#[tauri::command]
+async fn ask_ai_chat(
+    provider: String,
+    base_url: String,
+    model: String,
+    messages: Vec<ChatMessage>,
+) -> Result<ChatReply, String> {
+    let reply = blocking(move || providers::chat(&provider, &base_url, &model, &messages)).await;
+    match &reply {
+        Ok(reply) => activity::record(
+            "info",
+            "AI chat",
+            format!("{} via {}", reply.model, reply.provider),
+        ),
+        Err(error) => activity::record("error", "AI chat", error.clone()),
     }
-    result
+    reply
+}
+
+// ---------------------------------------------------------------------------
+// AI Action engine
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+async fn action_start(
+    prompt: String,
+    provider: String,
+    base_url: String,
+    model: String,
+    max_steps: Option<u32>,
+) -> Result<agent::ActionTaskView, String> {
+    let view =
+        blocking(move || agent::start(&prompt, &provider, &base_url, &model, max_steps)).await;
+    match &view {
+        Ok(view) => activity::record("info", "AI action started", view.prompt.clone()),
+        Err(error) => activity::record("error", "AI action", error.clone()),
+    }
+    view
+}
+
+#[tauri::command]
+async fn action_approve(
+    run_id: String,
+    approval_id: String,
+    approved: bool,
+) -> Result<agent::ActionTaskView, String> {
+    blocking(move || agent::approve(&run_id, &approval_id, approved)).await
+}
+
+#[tauri::command]
+async fn action_cancel(run_id: String) -> Result<agent::ActionTaskView, String> {
+    blocking(move || agent::cancel(&run_id)).await
+}
+
+#[tauri::command]
+async fn action_get(run_id: String) -> Result<agent::ActionTaskView, String> {
+    blocking(move || agent::get(&run_id)).await
+}
+
+#[tauri::command]
+async fn action_list() -> Result<Vec<agent::ActionTaskView>, String> {
+    blocking(agent::list).await
+}
+
+#[tauri::command]
+async fn action_tools() -> Result<Vec<serde_json::Value>, String> {
+    Ok(agent::describe_tools())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -435,7 +548,6 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_dashboard_status,
-            get_device_details,
             list_connected_devices,
             select_android_device,
             connect_waydroid_adb,
@@ -446,7 +558,6 @@ pub fn run() {
             get_power_progress,
             list_android_apps,
             get_android_app_info,
-            is_android_app_installed,
             get_android_foreground_app,
             launch_android_app,
             choose_android_apk,
@@ -470,8 +581,20 @@ pub fn run() {
             download_android_file,
             run_android_workflow,
             get_activity_log,
-            list_ollama_models,
-            ask_ollama
+            load_settings,
+            save_settings,
+            provider_health,
+            list_provider_models,
+            probe_provider_model,
+            set_provider_credential,
+            clear_provider_credential,
+            ask_ai_chat,
+            action_start,
+            action_approve,
+            action_cancel,
+            action_get,
+            action_list,
+            action_tools
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

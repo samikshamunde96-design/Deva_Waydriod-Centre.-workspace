@@ -23,4 +23,7 @@ into one success flag. Every workflow run is also recorded in the activity log.
 - No workflow resets, wipes, reinstalls or reconfigures Waydroid.
 - `bring_up` may start a stopped session because that is its stated purpose;
   other workflows never start or restart the session.
-- The AI assistant has no tools and cannot trigger a workflow.
+- The AI panel has two independent systems: a Chat provider/model that only
+  talks to the configured endpoint, and an Action provider/model that reaches
+  the device solely through the backend tool registry. Neither has shell access,
+  and uninstalling an app requires explicit approval.

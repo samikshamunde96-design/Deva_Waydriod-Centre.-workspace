@@ -1,4 +1,4 @@
-use waydroid_control_center_lib::{android, assistant, workflow};
+use waydroid_control_center_lib::{android, providers, workflow};
 
 #[test]
 #[ignore = "Requires explicit live Waydroid testing"]
@@ -43,14 +43,20 @@ fn live_waydroid_surface() {
         android::push_file_to_android("/tmp/opencode/upload-test.txt", "/sdcard/Download")
     );
 
-    println!("ollama models: {:?}", assistant::list_models());
+    println!(
+        "ollama models: {:?}",
+        providers::list_models(providers::OLLAMA, providers::DEFAULT_OLLAMA_URL)
+    );
     println!(
         "ollama chat: {:?}",
-        assistant::chat(
+        providers::chat(
+            providers::OLLAMA,
+            providers::DEFAULT_OLLAMA_URL,
             "qwen2.5-coder:1.5b",
-            &[assistant::ChatMessage {
+            &[providers::ChatMessage {
                 role: "user".to_string(),
                 content: "Reply with the single word: ready".to_string(),
+                images: None,
             }],
         )
     );

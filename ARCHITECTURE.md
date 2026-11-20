@@ -17,7 +17,11 @@ The application follows a conservative desktop control-center pattern:
 - `src-tauri/src/android/mod.rs`: ADB-backed packages, launch, screen capture, input, files and display
 - `src-tauri/src/workflow.rs`: fixed, validated multi-step workflows with per-step results
 - `src-tauri/src/activity.rs`: bounded in-memory outcome log
-- `src-tauri/src/assistant.rs`: loopback-only Ollama bridge with no device tools
+- `src-tauri/src/providers.rs`: chat/action provider adapters, model discovery,
+  capability probes and session-only credentials
+- `src-tauri/src/http.rs`: bounded `curl` transport used by every provider call
+- `src-tauri/src/agent.rs`: bounded Action engine with a fixed tool registry
+- `src-tauri/src/settings.rs`: validated, atomically written preferences
 
 ## Health model
 
@@ -40,5 +44,5 @@ The backend returns an explicit health classification to the UI:
 - Keep the UI responsive by using bounded command timeouts
 - Treat every shell input (paths, package names, key names, coordinates) as
   untrusted and validate it against a fixed allowlist before it reaches `adb`
-- Keep the assistant away from the control surface: it has no tools and only
-  talks to a loopback Ollama endpoint
+- Keep the AI surfaces separate: chat is a plain conversation, while the Action
+  engine reaches the device only through its fixed tool registry, never a shell

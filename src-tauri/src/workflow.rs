@@ -91,7 +91,15 @@ fn bring_up() -> WorkflowReport {
             Ok("Waydroid session is already running.".to_string()),
         )
     } else {
-        run.step("Start Waydroid session", start_session())
+        match start_session() {
+            Ok(outcome) if outcome.session_active() => {
+                run.step("Start Waydroid session", Ok(outcome.message))
+            }
+            // Still booting, permission denied or a dead child process is not a
+            // successful start, so the workflow cannot claim it was one.
+            Ok(outcome) => run.step("Start Waydroid session", Err(outcome.message)),
+            Err(error) => run.step("Start Waydroid session", Err(error)),
+        }
     };
     if !session_ok {
         return run.finish("bring_up", BRING_UP);

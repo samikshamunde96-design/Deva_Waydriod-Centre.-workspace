@@ -29,13 +29,11 @@ type DashboardStatus = {
   cpu_usage: string;
   memory_usage: string;
   storage_usage: string;
-  app_count: number | null;
   ip_address: string;
   session_user: string;
   wayland_display: string;
   vendor_type: string;
   last_operation: string;
-  automation_status: string;
   power_progress: string;
   probe_errors: string[];
 };
@@ -123,6 +121,94 @@ type ChatMessage = {
   content: string;
 };
 
+type AiSettings = {
+  version: number;
+  theme: "dark" | "light";
+  chat_provider: string;
+  chat_model: string;
+  action_provider: string;
+  action_model: string;
+  openai_base_url: string;
+  ollama_base_url: string;
+  auto_refresh: boolean;
+  last_android_directory: string;
+};
+
+type SettingsLoad = {
+  settings: AiSettings;
+  warning: string | null;
+};
+
+type ModelMetadata = {
+  name: string;
+  size_bytes: number | null;
+  modified_at: string | null;
+};
+
+type ModelCapabilities = {
+  provider: string;
+  model: string;
+  tools: boolean | null;
+  vision: boolean | null;
+  family: string | null;
+  parameter_size: string | null;
+  note: string;
+};
+
+type ChatReply = {
+  provider: string;
+  model: string;
+  content: string;
+};
+
+type ActionStep = {
+  index: number;
+  kind: string;
+  title: string;
+  detail: string;
+  ok: boolean;
+};
+
+type PendingApproval = {
+  id: string;
+  tool: string;
+  summary: string;
+  arguments: unknown;
+};
+
+type ActionTask = {
+  id: string;
+  prompt: string;
+  provider: string;
+  base_url: string;
+  model: string;
+  status: string;
+  steps: ActionStep[];
+  pending_approval: PendingApproval | null;
+  result: string | null;
+  error: string | null;
+  started_at: number;
+  finished_at: number | null;
+  max_steps: number;
+};
+
+const terminalTaskStatuses = new Set(["completed", "failed", "cancelled"]);
+
+function defaultSettings(): AiSettings {
+  return {
+    version: 1,
+    theme: "dark",
+    chat_provider: "ollama",
+    chat_model: "",
+    action_provider: "ollama",
+    action_model: "",
+    openai_base_url: "https://api.openai.com/v1",
+    ollama_base_url: "http://127.0.0.1:11434",
+    auto_refresh: false,
+    last_android_directory: "/sdcard",
+  };
+}
+
 type NavKey =
   | "dashboard"
   | "live"
@@ -165,13 +251,11 @@ const emptyStatus: DashboardStatus = {
   cpu_usage: "Unavailable",
   memory_usage: "Unavailable",
   storage_usage: "Unavailable",
-  app_count: null,
   ip_address: "Unavailable",
   session_user: "Unavailable",
   wayland_display: "Unavailable",
   vendor_type: "Unavailable",
   last_operation: "Awaiting system query",
-  automation_status: "Idle",
   power_progress: "Idle",
   probe_errors: [],
 };
@@ -224,7 +308,7 @@ function App() {
   const [screenshot, setScreenshot] = useState("");
   const [liveError, setLiveError] = useState("");
   const [liveAction, setLiveAction] = useState("");
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const [filePath, setFilePath] = useState("/sdcard");
   const [fileEntries, setFileEntries] = useState<AndroidFileEntry[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
@@ -241,17 +325,32 @@ function App() {
   const [logEntries, setLogEntries] = useState<ActivityLogEntry[]>([]);
   const [logLoading, setLogLoading] = useState(false);
   const [models, setModels] = useState<string[]>([]);
-  const [modelChoice, setModelChoice] = useState("");
+  const [actionModels, setActionModels] = useState<string[]>([]);
   const [chat, setChat] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [chatBusy, setChatBusy] = useState(false);
   const [chatError, setChatError] = useState("");
+  const [settings, setSettings] = useState<AiSettings>(defaultSettings);
+  const [settingsError, setSettingsError] = useState("");
+  const [settingsSaved, setSettingsSaved] = useState("");
+  const [credentialInput, setCredentialInput] = useState("");
+  const [credentialStatus, setCredentialStatus] = useState("");
+  const [capabilityNote, setCapabilityNote] = useState("");
+  const [actionPrompt, setActionPrompt] = useState("");
+  const [actionTask, setActionTask] = useState<ActionTask | null>(null);
+  const [actionError, setActionError] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
   const restartDialog = useRef<HTMLDialogElement>(null);
+  const stopDialog = useRef<HTMLDialogElement>(null);
   const installDialog = useRef<HTMLDialogElement>(null);
   const uninstallDialog = useRef<HTMLDialogElement>(null);
   const [uninstallTarget, setUninstallTarget] = useState<AppInfo | null>(null);
   const dragStart = useRef<{ x: number; y: number } | null>(null);
   const currentStatus = status ?? emptyStatus;
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
   async function refreshStatus(updateMessage = true) {
     setBusy(true);
@@ -263,7 +362,9 @@ function App() {
         setActionMessage(data.last_operation || "Status refreshed");
       }
     } catch (error) {
-      setStatus(emptyStatus);
+      // Keep the last known status: replacing it with defaults would show
+      // "Waydroid not installed" for a transient query failure.
+      setStatus((previous) => previous);
       setActionMessage(`Status error: ${String(error)}`);
     } finally {
       setBusy(false);
@@ -438,6 +539,26 @@ function App() {
       setActionMessage(await invoke<string>("cancel_android_operation"));
     } catch (error) {
       setActionMessage(`Cancellation failed: ${String(error)}`);
+    }
+  }
+
+  function handleStopDialogClose() {
+    const dialog = stopDialog.current;
+    if (!dialog) return;
+    const approved = dialog.returnValue === "confirm";
+    dialog.returnValue = "";
+    if (approved) {
+      void (async () => {
+        setBusy(true);
+        try {
+          setActionMessage(await invoke<string>("stop_waydroid", { approved: true }));
+        } catch (error) {
+          setActionMessage(`Stop failed: ${String(error)}`);
+        } finally {
+          setBusy(false);
+          await refreshStatus(false);
+        }
+      })();
     }
   }
 
@@ -674,38 +795,201 @@ function App() {
     }
   }
 
-  async function loadModels() {
-    setChatError("");
+  async function loadSettings() {
     try {
-      const found = await invoke<string[]>("list_ollama_models");
-      setModels(found);
-      if (!found.includes(modelChoice)) {
-        setModelChoice(found[0] ?? "");
+      const loaded = await invoke<SettingsLoad>("load_settings");
+      setSettings(loaded.settings);
+      setTheme(loaded.settings.theme);
+      setAutoRefresh(loaded.settings.auto_refresh);
+      setSettingsError(loaded.warning ?? "");
+    } catch (error) {
+      setSettingsError(`Settings could not be loaded: ${String(error)}`);
+    }
+  }
+
+  async function persistSettings(next: AiSettings, message: string) {
+    setSettingsSaved("");
+    try {
+      const saved = await invoke<AiSettings>("save_settings", { next });
+      setSettings(saved);
+      setSettingsError("");
+      setSettingsSaved(message);
+      setTheme(saved.theme);
+      setAutoRefresh(saved.auto_refresh);
+    } catch (error) {
+      setSettingsError(String(error));
+    }
+  }
+
+  function baseUrlFor(provider: string): string {
+    return provider === "ollama" ? settings.ollama_base_url : settings.openai_base_url;
+  }
+
+  async function loadModels(role: "chat" | "action") {
+    const provider = role === "chat" ? settings.chat_provider : settings.action_provider;
+    const baseUrl = baseUrlFor(provider);
+    setChatError("");
+    setCapabilityNote("");
+    try {
+      const found = await invoke<ModelMetadata[]>("list_provider_models", {
+        provider,
+        baseUrl,
+      });
+      const names = found.map((model) => model.name);
+      if (role === "chat") {
+        setModels(names);
+        if (!names.includes(settings.chat_model)) {
+          const next = { ...settings, chat_model: names[0] ?? "" };
+          await persistSettings(next, "Chat model updated from the provider list.");
+        }
+      } else {
+        setActionModels(names);
+        if (!names.includes(settings.action_model)) {
+          await persistSettings(
+            { ...settings, action_model: names[0] ?? "" },
+            "Action model updated from the provider list.",
+          );
+        }
       }
     } catch (error) {
-      setModels([]);
-      setChatError(String(error));
+      if (role === "chat") {
+        setModels([]);
+        setChatError(String(error));
+      } else {
+        setActionModels([]);
+        setActionError(String(error));
+      }
+    }
+  }
+
+  async function probeModel(role: "chat" | "action", model: string) {
+    const provider = role === "chat" ? settings.chat_provider : settings.action_provider;
+    if (!model) return;
+    setCapabilityNote("");
+    try {
+      const capabilities = await invoke<ModelCapabilities>("probe_provider_model", {
+        provider,
+        baseUrl: baseUrlFor(provider),
+        model,
+      });
+      const format = (value: boolean | null) =>
+        value === true ? "reported" : value === false ? "not supported" : "not reported";
+      setCapabilityNote(
+        `${provider} / ${model}: tool calling ${format(capabilities.tools)}, vision ${format(
+          capabilities.vision,
+        )}. ${capabilities.note}`,
+      );
+    } catch (error) {
+      setCapabilityNote(String(error));
+    }
+  }
+
+  async function saveCredential() {
+    const secret = credentialInput.trim();
+    if (!secret) {
+      setCredentialStatus("Enter an API key first.");
+      return;
+    }
+    try {
+      await invoke<boolean>("set_provider_credential", {
+        provider: "openai_compatible",
+        secret,
+      });
+      setCredentialInput("");
+      setCredentialStatus(
+        "Key stored in this app session only. It is not written to disk and will be forgotten on exit.",
+      );
+    } catch (error) {
+      setCredentialStatus(String(error));
+    }
+  }
+
+  async function forgetCredential() {
+    try {
+      await invoke<boolean>("clear_provider_credential", { provider: "openai_compatible" });
+      setCredentialStatus("Session key cleared.");
+    } catch (error) {
+      setCredentialStatus(String(error));
     }
   }
 
   async function sendChat() {
     const prompt = chatInput.trim();
-    if (!prompt || !modelChoice) return;
+    if (!prompt || !settings.chat_model) return;
     const next: ChatMessage[] = [...chat, { role: "user", content: prompt }];
     setChat(next);
     setChatInput("");
     setChatBusy(true);
     setChatError("");
     try {
-      const reply = await invoke<string>("ask_ollama", {
-        model: modelChoice,
+      const reply = await invoke<ChatReply>("ask_ai_chat", {
+        provider: settings.chat_provider,
+        baseUrl: baseUrlFor(settings.chat_provider),
+        model: settings.chat_model,
         messages: next,
       });
-      setChat([...next, { role: "assistant", content: reply }]);
+      setChat([...next, { role: "assistant", content: reply.content }]);
     } catch (error) {
       setChatError(String(error));
     } finally {
       setChatBusy(false);
+    }
+  }
+
+  async function startAction() {
+    const prompt = actionPrompt.trim();
+    if (!prompt) return;
+    if (!settings.action_model) {
+      setActionError("Choose an Action model first.");
+      return;
+    }
+    setActionBusy(true);
+    setActionError("");
+    try {
+      const task = await invoke<ActionTask>("action_start", {
+        prompt,
+        provider: settings.action_provider,
+        baseUrl: baseUrlFor(settings.action_provider),
+        model: settings.action_model,
+        maxSteps: 6,
+      });
+      setActionTask(task);
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function decideAction(approved: boolean) {
+    const task = actionTask;
+    if (!task?.pending_approval) return;
+    setActionBusy(true);
+    setActionError("");
+    try {
+      setActionTask(
+        await invoke<ActionTask>("action_approve", {
+          runId: task.id,
+          approvalId: task.pending_approval.id,
+          approved,
+        }),
+      );
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  async function cancelAction() {
+    if (!actionTask) return;
+    setActionBusy(true);
+    try {
+      setActionTask(await invoke<ActionTask>("action_cancel", { runId: actionTask.id }));
+    } catch (error) {
+      setActionError(String(error));
+    } finally {
+      setActionBusy(false);
     }
   }
 
@@ -718,6 +1002,7 @@ function App() {
 
   useEffect(() => {
     void refreshStatus();
+    void loadSettings();
   }, []);
 
   useEffect(() => {
@@ -747,10 +1032,30 @@ function App() {
       void loadLog();
     }
     if (activeNav === "assistant" && models.length === 0) {
-      void loadModels();
+      void loadModels("chat");
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeNav, currentStatus.selected_device?.serial]);
+
+  useEffect(() => {
+    const task = actionTask;
+    if (!task || terminalTaskStatuses.has(task.status)) {
+      return;
+    }
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void invoke<ActionTask>("action_get", { runId: task.id })
+        .then((next) => {
+          if (!cancelled) setActionTask(next);
+        })
+        .catch(() => {});
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actionTask?.id, actionTask?.status]);
 
   useEffect(() => {
     if (activeNav !== "live" || !currentStatus.selected_device) {
@@ -759,6 +1064,9 @@ function App() {
     let cancelled = false;
     let inFlight = false;
     const tick = async () => {
+      // Live frames are only useful while the window is visible; a hidden
+      // webview would otherwise keep waking the device.
+      if (document.hidden) return;
       if (inFlight) return;
       inFlight = true;
       try {
@@ -779,7 +1087,7 @@ function App() {
         cancelled = true;
       };
     }
-    const timer = window.setInterval(() => void tick(), 2000);
+    const timer = window.setInterval(() => void tick(), 3000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -957,7 +1265,7 @@ function App() {
         <button type="button" onClick={() => void runAction("start_waydroid")} disabled={busy}>
           Start session
         </button>
-        <button type="button" onClick={() => void runAction("stop_waydroid")} disabled={busy}>
+        <button type="button" onClick={() => stopDialog.current?.showModal()} disabled={busy}>
           Stop session
         </button>
         <button type="button" onClick={() => void runAction("open_android_ui")} disabled={busy || !selectedWaydroid}>
@@ -1015,7 +1323,6 @@ function App() {
             <li><span>Memory</span> <strong>{currentStatus.memory_usage}</strong></li>
             <li><span>Storage</span> <strong>{currentStatus.storage_usage}</strong></li>
             <li><span>Resolution</span> <strong>{currentStatus.resolution}</strong></li>
-            <li><span>Applications</span> <strong>{currentStatus.app_count ?? "Open Applications"}</strong></li>
             <li><span>Android version</span> <strong>{currentStatus.android_version}</strong></li>
           </ul>
         </article>
@@ -1262,22 +1569,170 @@ function App() {
     <section className="panel control-panel">
       <div className="panel-head">
         <div>
-          <h2>Local AI assistant</h2>
+          <h2>AI providers</h2>
           <p>
-            Runs against your local Ollama service on localhost:11434. It has no device tools, so it
-            cannot run commands, install apps or change Android state.
+            Chat answers questions only. Actions run device tools through a fixed allowlist and
+            require approval for destructive steps. Credentials stay in memory for this session.
           </p>
         </div>
-        <div className="head-actions">
-          <select value={modelChoice} onChange={(event) => setModelChoice(event.target.value)} aria-label="Ollama model">
-            <option value="">Choose a model</option>
-            {models.map((model) => (
-              <option key={model} value={model}>{model}</option>
-            ))}
-          </select>
-          <button type="button" className="ghost" onClick={() => void loadModels()} disabled={chatBusy}>
-            Reload models
-          </button>
+      </div>
+
+      {settingsError && <div className="empty-state" role="alert">{settingsError}</div>}
+      {settingsSaved && <div className="empty-state" role="status">{settingsSaved}</div>}
+
+      <div className="detail-grid">
+        <article className="mini-card">
+          <h3>Chat model</h3>
+          <div className="field-grid">
+            <label>
+              Provider
+              <select
+                value={settings.chat_provider}
+                onChange={(event) =>
+                  void persistSettings(
+                    { ...settings, chat_provider: event.target.value, chat_model: "" },
+                    "Chat provider saved. Reload models to choose one.",
+                  )
+                }
+              >
+                <option value="ollama">Ollama (local)</option>
+                <option value="openai_compatible">OpenAI-compatible</option>
+              </select>
+            </label>
+            <label>
+              Base URL
+              <input
+                value={baseUrlFor(settings.chat_provider)}
+                onChange={(event) =>
+                  setSettings({
+                    ...settings,
+                    ...(settings.chat_provider === "ollama"
+                      ? { ollama_base_url: event.target.value }
+                      : { openai_base_url: event.target.value }),
+                  })
+                }
+                onBlur={() => void persistSettings(settings, "Chat base URL saved.")}
+                aria-label="Chat provider base URL"
+              />
+            </label>
+            <label>
+              Model
+              <select
+                value={settings.chat_model}
+                onChange={(event) => {
+                  void persistSettings(
+                    { ...settings, chat_model: event.target.value },
+                    "Chat model saved.",
+                  );
+                  void probeModel("chat", event.target.value);
+                }}
+              >
+                <option value="">Choose a model</option>
+                {models.map((model) => (
+                  <option key={model} value={model}>{model}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="toolbar-row">
+            <button type="button" className="ghost" onClick={() => void loadModels("chat")}>
+              Reload models
+            </button>
+          </div>
+
+          {settings.chat_provider === "openai_compatible" && (
+            <div className="field-grid">
+              <label>
+                Session API key
+                <input
+                  type="password"
+                  value={credentialInput}
+                  onChange={(event) => setCredentialInput(event.target.value)}
+                  autoComplete="off"
+                  placeholder="Not stored on disk"
+                />
+              </label>
+              <div className="toolbar-row">
+                <button type="button" onClick={() => void saveCredential()}>Use for this session</button>
+                <button type="button" className="ghost" onClick={() => void forgetCredential()}>Forget key</button>
+              </div>
+              {credentialStatus && <p className="hint">{credentialStatus}</p>}
+            </div>
+          )}
+        </article>
+
+        <article className="mini-card">
+          <h3>Action model</h3>
+          <div className="field-grid">
+            <label>
+              Provider
+              <select
+                value={settings.action_provider}
+                onChange={(event) =>
+                  void persistSettings(
+                    { ...settings, action_provider: event.target.value, action_model: "" },
+                    "Action provider saved. Reload models to choose one.",
+                  )
+                }
+              >
+                <option value="ollama">Ollama (local)</option>
+                <option value="openai_compatible">OpenAI-compatible</option>
+              </select>
+            </label>
+            <label>
+              Base URL
+              <input
+                value={baseUrlFor(settings.action_provider)}
+                onChange={(event) =>
+                  setSettings({
+                    ...settings,
+                    ...(settings.action_provider === "ollama"
+                      ? { ollama_base_url: event.target.value }
+                      : { openai_base_url: event.target.value }),
+                  })
+                }
+                onBlur={() => void persistSettings(settings, "Action base URL saved.")}
+                aria-label="Action provider base URL"
+              />
+            </label>
+            <label>
+              Model
+              <select
+                value={settings.action_model}
+                onChange={(event) => {
+                  void persistSettings(
+                    { ...settings, action_model: event.target.value },
+                    "Action model saved.",
+                  );
+                  void probeModel("action", event.target.value);
+                }}
+              >
+                <option value="">Choose a model</option>
+                {actionModels.map((model) => (
+                  <option key={model} value={model}>{model}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className="toolbar-row">
+            <button type="button" className="ghost" onClick={() => void loadModels("action")}>
+              Reload models
+            </button>
+          </div>
+          {settings.action_provider === "openai_compatible" && (
+            <p className="hint">
+              Uses the session key configured for the chat provider. Nothing is written to disk.
+            </p>
+          )}
+        </article>
+      </div>
+
+      {capabilityNote && <p className="hint" role="status">{capabilityNote}</p>}
+
+      <div className="panel-head">
+        <div>
+          <h2>Chat</h2>
+          <p>Answers are generated by the selected model and must be verified before you act on them.</p>
         </div>
       </div>
 
@@ -1286,8 +1741,7 @@ function App() {
       <div className="chat-log">
         {chat.length === 0 && !chatBusy ? (
           <div className="empty-state">
-            Ask about Waydroid, ADB or Android behaviour. Answers are generated by a local model and
-            must be verified before you act on them.
+            Ask about Waydroid, ADB or Android behaviour. This conversation cannot change the device.
           </div>
         ) : (
           <>
@@ -1300,7 +1754,7 @@ function App() {
             {chatBusy && (
               <div className="chat-bubble assistant">
                 <strong>Assistant</strong>
-                <p>Thinking locally…</p>
+                <p>Waiting for {settings.chat_model || "a model"}…</p>
               </div>
             )}
           </>
@@ -1313,14 +1767,14 @@ function App() {
           onChange={(event) => setChatInput(event.target.value)}
           onKeyDown={handleChatKeyDown}
           rows={3}
-          placeholder="Ask the local model… (Enter sends, Shift+Enter adds a line)"
-          aria-label="Message to the local model"
+          placeholder="Ask the selected model… (Enter sends, Shift+Enter adds a line)"
+          aria-label="Message to the chat model"
         />
         <button
           type="button"
           className="primary"
           onClick={() => void sendChat()}
-          disabled={chatBusy || !modelChoice || !chatInput.trim()}
+          disabled={chatBusy || !settings.chat_model || !chatInput.trim()}
         >
           {chatBusy ? "Waiting…" : "Send"}
         </button>
@@ -1328,6 +1782,77 @@ function App() {
           Clear
         </button>
       </div>
+
+      <div className="panel-head">
+        <div>
+          <h2>Action task</h2>
+          <p>
+            The model picks one tool per step from a fixed allowlist (no shell). Uninstalling an app
+            always asks for your approval first.
+          </p>
+        </div>
+      </div>
+
+      {actionError && <div className="empty-state" role="alert">{actionError}</div>}
+
+      <div className="toolbar-row chat-input-row">
+        <textarea
+          value={actionPrompt}
+          onChange={(event) => setActionPrompt(event.target.value)}
+          rows={2}
+          placeholder="Describe a task, for example: open Settings and report the Android version"
+          aria-label="Action task description"
+        />
+        <button
+          type="button"
+          className="primary"
+          onClick={() => void startAction()}
+          disabled={actionBusy || !actionPrompt.trim() || !settings.action_model}
+        >
+          {actionBusy ? "Starting…" : "Run task"}
+        </button>
+      </div>
+
+      {actionTask && (
+        <section className="workflow-report" aria-live="polite">
+          <h3>
+            {actionTask.prompt}
+            <span className={`pill ${actionTask.status === "completed" ? "good" : actionTask.status === "failed" ? "bad" : "warn"}`}>
+              {actionTask.status}
+            </span>
+          </h3>
+          <p className="hint">
+            {actionTask.provider} / {actionTask.model} · step budget {actionTask.max_steps}
+          </p>
+          <ol className="step-list">
+            {actionTask.steps.map((step) => (
+              <li key={step.index} className={step.ok ? "step ok" : "step error"}>
+                <strong>{step.title}</strong>
+                <span>{step.detail}</span>
+              </li>
+            ))}
+          </ol>
+          {actionTask.pending_approval && (
+            <div className="toolbar-row" role="alert">
+              <span>Approve: {actionTask.pending_approval.summary}</span>
+              <button type="button" className="primary" onClick={() => void decideAction(true)} disabled={actionBusy}>
+                Approve
+              </button>
+              <button type="button" onClick={() => void decideAction(false)} disabled={actionBusy}>
+                Decline
+              </button>
+            </div>
+          )}
+          {!terminalTaskStatuses.has(actionTask.status) && (
+            <div className="toolbar-row">
+              <button type="button" className="ghost" onClick={() => void cancelAction()} disabled={actionBusy}>
+                Cancel task
+              </button>
+            </div>
+          )}
+          {actionTask.error && <div className="empty-state" role="alert">{actionTask.error}</div>}
+        </section>
+      )}
     </section>
   );
 
@@ -1343,6 +1868,31 @@ function App() {
             Read current
           </button>
         </div>
+      </div>
+
+      <div className="detail-grid">
+        <article className="mini-card">
+          <h3>Preferences</h3>
+          <label>
+            <input
+              type="checkbox"
+              checked={autoRefresh}
+              onChange={(event) =>
+                void persistSettings(
+                  { ...settings, auto_refresh: event.target.checked },
+                  "Live refresh preference saved.",
+                )
+              }
+            />{" "}
+            Refresh live frames automatically every 3 seconds
+          </label>
+          <p className="hint">
+            Stored in $XDG_CONFIG_HOME/waydroid-control-center/settings.json. AI credentials are
+            never written to disk.
+          </p>
+          {settingsError && <p className="hint" role="alert">{settingsError}</p>}
+          {settingsSaved && <p className="hint" role="status">{settingsSaved}</p>}
+        </article>
       </div>
 
       <div className="detail-grid">
@@ -1609,7 +2159,15 @@ function App() {
             <button type="button" className="ghost" onClick={() => void refreshStatus()} disabled={busy}>
               {busy ? "Refreshing..." : "Refresh"}
             </button>
-            <button type="button" className="theme-toggle" onClick={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}>
+            <button
+              type="button"
+              className="theme-toggle"
+              onClick={() => {
+                const next = theme === "dark" ? "light" : "dark";
+                setTheme(next);
+                void persistSettings({ ...settings, theme: next }, "Theme preference saved.");
+              }}
+            >
               {theme === "dark" ? "Light" : "Dark"}
             </button>
           </div>
@@ -1664,6 +2222,24 @@ function App() {
             </button>
           </div>
         </div>
+      </dialog>
+      <dialog
+        ref={stopDialog}
+        className="restart-dialog"
+        aria-labelledby="stop-dialog-title"
+        onClose={handleStopDialogClose}
+      >
+        <form method="dialog">
+          <h2 id="stop-dialog-title">Stop Waydroid session?</h2>
+          <p>
+            This ends the Android session and closes running apps. Android data is not deleted.
+            Continue only if you accept the interruption.
+          </p>
+          <div className="dialog-actions">
+            <button type="submit" value="cancel" autoFocus>Cancel</button>
+            <button type="submit" value="confirm" className="primary">Stop session</button>
+          </div>
+        </form>
       </dialog>
       <dialog
         ref={restartDialog}

@@ -575,7 +575,7 @@ pub fn list_installed_apps(device_serial: &str) -> Result<Vec<AppEntry>, String>
         );
     }
     verify_device_connected(&selected)?;
-    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready(&selected)?;
+    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready_readonly(&selected)?;
     let raw = adb_command(device_serial, &["shell", "pm", "list", "packages", "-f"])?;
     Ok(parse_installed_packages(&raw))
 }
@@ -595,7 +595,7 @@ pub fn is_app_installed(device_serial: &str, package_name: &str) -> Result<bool,
         );
     }
     verify_device_connected(&selected)?;
-    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready(&selected)?;
+    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready_readonly(&selected)?;
     let output = adb_command(
         device_serial,
         &["shell", "pm", "list", "packages", package_name],
@@ -626,7 +626,7 @@ pub fn get_app_info(device_serial: &str, package_name: &str) -> Result<AppInfo, 
         );
     }
     verify_device_connected(&selected)?;
-    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready(&selected)?;
+    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready_readonly(&selected)?;
     if !is_app_installed(device_serial, package_name)? {
         return Err(format!(
             "Application {package_name} is not installed on the selected device."
@@ -720,7 +720,7 @@ pub fn launch_app(device_serial: &str, package_name: &str) -> Result<String, Str
         );
     }
     verify_device_connected(&selected)?;
-    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready(&selected)?;
+    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready_readonly(&selected)?;
     if !is_app_installed(device_serial, package_name)? {
         return Err(format!(
             "Application {package_name} is not installed on the selected device."
@@ -790,7 +790,7 @@ pub fn get_foreground_app(device_serial: &str) -> Result<String, String> {
         );
     }
     verify_device_connected(&selected)?;
-    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready(&selected)?;
+    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready_readonly(&selected)?;
     let raw = adb_command(device_serial, &["shell", "dumpsys", "window", "windows"])?;
     foreground_component(&raw)
         .ok_or_else(|| "Android did not report a foreground application.".to_string())
@@ -817,7 +817,7 @@ pub fn screenshot_base64() -> Result<String, String> {
     Ok(base64_encode(&capture_screenshot()?))
 }
 
-fn base64_encode(bytes: &[u8]) -> String {
+pub(crate) fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -845,7 +845,7 @@ fn base64_encode(bytes: &[u8]) -> String {
 
 const MAX_INPUT_COORDINATE: u32 = 8_192;
 
-fn validate_point(x: u32, y: u32) -> Result<(), String> {
+pub(crate) fn validate_point(x: u32, y: u32) -> Result<(), String> {
     if x > MAX_INPUT_COORDINATE || y > MAX_INPUT_COORDINATE {
         return Err(format!(
             "Screen coordinates must be between 0 and {MAX_INPUT_COORDINATE}."
@@ -915,6 +915,38 @@ pub fn press_key(key: &str) -> Result<String, String> {
     Ok(format!("Sent key event {key}."))
 }
 
+/// Text input is limited to a conservative alphabet so it can be quoted and
+/// forwarded through `input text` without shell or IME surprises.
+pub fn input_text(text: &str) -> Result<String, String> {
+    if text.trim().is_empty() {
+        return Err("Text to type cannot be empty.".to_string());
+    }
+    if text.chars().count() > 500 {
+        return Err("Text input is limited to 500 characters.".to_string());
+    }
+    if text.chars().any(|ch| {
+        !(ch.is_ascii_alphanumeric()
+            || matches!(
+                ch,
+                ' ' | '.' | ',' | '!' | '?' | '@' | '_' | '-' | '+' | '/' | ':'
+            ))
+    }) {
+        return Err(
+            "Text input may only contain letters, digits, spaces and . , ! ? @ _ - + / :"
+                .to_string(),
+        );
+    }
+    let selected = selected_ready_device()?;
+    // `input text` uses %s for a literal space.
+    let encoded = text.replace(' ', "%s");
+    let command = format!("input text {}", shell_quote(&encoded));
+    adb_command_timeout(&selected.serial, &["shell", &command], 8)?;
+    Ok(format!(
+        "Typed {} characters into the focused field.",
+        text.chars().count()
+    ))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AndroidFileEntry {
     pub name: String,
@@ -924,8 +956,16 @@ pub struct AndroidFileEntry {
     pub modified: String,
 }
 
-/// Remote paths are passed to the device shell, so only characters that cannot
-/// be split or re-interpreted are accepted.
+/// Quotes one value for Android's device-side shell. The host never runs a
+/// shell: `adb shell <string>` forwards that single string to the device shell,
+/// so remote paths and text need their own quoting.
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Remote paths travel through the device shell, so they must be absolute,
+/// bounded and free of control characters. Spaces and quotes are allowed now
+/// that every remote path is passed through `shell_quote`.
 pub fn validate_android_path(path: &str) -> Result<(), String> {
     if !path.starts_with('/') {
         return Err("Android path must be absolute, for example /sdcard/Download.".to_string());
@@ -936,13 +976,8 @@ pub fn validate_android_path(path: &str) -> Result<(), String> {
     if path.split('/').any(|segment| segment == "..") {
         return Err("Android path cannot contain '..' segments.".to_string());
     }
-    if path
-        .chars()
-        .any(|ch| !(ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-')))
-    {
-        return Err(
-            "Android path may only contain letters, digits, '/', '.', '_' and '-'.".to_string(),
-        );
+    if path.chars().any(char::is_control) {
+        return Err("Android path cannot contain control characters.".to_string());
     }
     Ok(())
 }
@@ -986,11 +1021,8 @@ fn listing_target(path: &str) -> String {
 pub fn list_android_files(path: &str) -> Result<Vec<AndroidFileEntry>, String> {
     validate_android_path(path)?;
     let selected = selected_ready_device()?;
-    let raw = adb_command_timeout(
-        &selected.serial,
-        &["shell", "ls", "-l", &listing_target(path)],
-        8,
-    )?;
+    let command = format!("ls -l {}", shell_quote(&listing_target(path)));
+    let raw = adb_command_timeout(&selected.serial, &["shell", &command], 8)?;
     let mut entries = parse_ls_long(&raw);
     entries.sort_by(|a, b| {
         b.is_dir
@@ -998,6 +1030,15 @@ pub fn list_android_files(path: &str) -> Result<Vec<AndroidFileEntry>, String> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     Ok(entries)
+}
+
+fn remote_file_size(device_serial: &str, remote_path: &str) -> Result<u64, String> {
+    let command = format!("stat -c %s {}", shell_quote(remote_path));
+    let raw = adb_command_timeout(device_serial, &["shell", &command], 8)
+        .map_err(|error| format!("Could not read the remote file size: {error}"))?;
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|_| format!("The device did not report a usable file size for {remote_path}."))
 }
 
 pub fn push_file_to_android(local_path: &str, remote_dir: &str) -> Result<String, String> {
@@ -1017,20 +1058,26 @@ pub fn push_file_to_android(local_path: &str, remote_dir: &str) -> Result<String
         .ok_or_else(|| "Local filename is not valid UTF-8.".to_string())?;
     let selected = selected_ready_device()?;
     adb_command_timeout(&selected.serial, &["push", local_path, remote_dir], 300)?;
-    let listing = adb_command_timeout(
-        &selected.serial,
-        &["shell", "ls", "-l", &listing_target(remote_dir)],
-        10,
-    )?;
-    if !parse_ls_long(&listing)
-        .iter()
-        .any(|entry| entry.name == name && !entry.is_dir)
-    {
+    let command = format!("ls -l {}", shell_quote(&listing_target(remote_dir)));
+    let listing = adb_command_timeout(&selected.serial, &["shell", &command], 10)?;
+    let Some(uploaded) = parse_ls_long(&listing)
+        .into_iter()
+        .find(|entry| entry.name == name && !entry.is_dir)
+    else {
         return Err(format!(
             "ADB reported success, but {name} is not listed in {remote_dir}."
         ));
+    };
+    if uploaded.size_bytes != metadata.len() {
+        return Err(format!(
+            "ADB reported success, but {name} is listed as {} bytes instead of {} bytes.",
+            uploaded.size_bytes,
+            metadata.len()
+        ));
     }
-    Ok(format!("Uploaded {name} to {remote_dir} and verified it."))
+    Ok(format!(
+        "Uploaded {name} to {remote_dir} and verified its size."
+    ))
 }
 
 pub fn choose_upload_file() -> Result<Option<String>, String> {
@@ -1070,9 +1117,16 @@ pub fn pull_file_from_android(remote_path: &str) -> Result<Option<String>, Strin
         return Ok(None);
     };
     let selected = selected_ready_device()?;
+    let remote_size = remote_file_size(&selected.serial, remote_path)?;
     adb_command_timeout(&selected.serial, &["pull", remote_path, &save_path], 300)?;
-    std::fs::metadata(&save_path)
-        .map_err(|error| format!("ADB reported success, but {save_path} is unreadable: {error}"))?;
+    let local_size = std::fs::metadata(&save_path)
+        .map_err(|error| format!("ADB reported success, but {save_path} is unreadable: {error}"))?
+        .len();
+    if local_size != remote_size {
+        return Err(format!(
+            "Download verification failed: the device reported {remote_size} bytes but {save_path} is {local_size} bytes."
+        ));
+    }
     Ok(Some(save_path))
 }
 
@@ -1144,7 +1198,7 @@ pub fn install_apk(device_serial: &str, apk_path: &str, approved: bool) -> Resul
         );
     }
     verify_device_connected(&selected)?;
-    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready(&selected)?;
+    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready_readonly(&selected)?;
     let output = adb_command(device_serial, &["install", "-r", &apk.path])?;
     if !output.contains("Success") {
         return Err(format!("APK installation failed: {output}"));
@@ -1179,7 +1233,7 @@ pub fn uninstall_app(
         );
     }
     verify_device_connected(&selected)?;
-    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready(&selected)?;
+    crate::waydroid::WaydroidPowerManager::new().ensure_android_ready_readonly(&selected)?;
     let install_path = adb_command(device_serial, &["shell", "pm", "path", package_name])?
         .lines()
         .find_map(|line| line.strip_prefix("package:").map(str::to_string))
@@ -1206,18 +1260,15 @@ pub fn uninstall_app(
 }
 
 /// Runs kdialog when available, otherwise zenity, and returns the chosen path.
-/// Exit code 1 is the native "user cancelled" result.
+/// Exit code 1 is the native "user cancelled" result; the dialog is bounded so
+/// a stuck picker cannot hold the command forever.
 fn native_picker(kdialog_args: &[&str], zenity_args: &[&str]) -> Result<Option<String>, String> {
-    let (program, args) = if Command::new("kdialog").arg("--version").output().is_ok() {
+    let (program, args) = if crate::waydroid::command_ok("kdialog", &["--version"]) {
         ("kdialog", kdialog_args)
     } else {
         ("zenity", zenity_args)
     };
-    let output = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| format!("Unable to open the native file picker: {error}"))?;
+    let output = crate::waydroid::run_output(program, args, 300)?;
     if output.status.success() {
         let path = String::from_utf8_lossy(&output.stdout)
             .trim_end_matches(['\r', '\n'])
@@ -1228,6 +1279,8 @@ fn native_picker(kdialog_args: &[&str], zenity_args: &[&str]) -> Result<Option<S
         Ok(Some(path))
     } else if output.status.code() == Some(1) {
         Ok(None)
+    } else if matches!(output.status.code(), Some(124 | 137)) {
+        Err("The native file picker timed out after five minutes.".to_string())
     } else {
         let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
         Err(if detail.is_empty() {
@@ -1450,12 +1503,26 @@ mod tests {
     }
 
     #[test]
-    fn android_paths_are_restricted_to_shell_safe_absolute_values() {
+    fn android_paths_are_absolute_and_free_of_traversal_or_control_characters() {
         assert!(validate_android_path("/sdcard/Download").is_ok());
+        assert!(validate_android_path("/sdcard/My Files").is_ok());
+        assert!(validate_android_path("/sdcard/My Files/report (final).pdf").is_ok());
         assert!(validate_android_path("sdcard/Download").is_err());
         assert!(validate_android_path("/sdcard/../data").is_err());
-        assert!(validate_android_path("/sdcard/Download;reboot").is_err());
-        assert!(validate_android_path("/sdcard/My Files").is_err());
+        assert!(validate_android_path("/sdcard/Download\nreboot").is_err());
+        assert!(validate_android_path("/sdcard/Download\0").is_err());
+    }
+
+    #[test]
+    fn remote_shell_quoting_neutralises_metacharacters_and_quotes() {
+        assert_eq!(shell_quote("/sdcard/My Files"), "'/sdcard/My Files'");
+        assert_eq!(
+            shell_quote("/sdcard/O'Brien/file.txt"),
+            "'/sdcard/O'\\''Brien/file.txt'"
+        );
+        // Single quotes keep `$()`, `;` and backticks literal on the device side.
+        let quoted = shell_quote("/sdcard/$(reboot);x`y`");
+        assert_eq!(quoted, "'/sdcard/$(reboot);x`y`'");
     }
 
     #[test]
