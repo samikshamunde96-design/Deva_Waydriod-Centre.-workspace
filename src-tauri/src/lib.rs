@@ -3,6 +3,7 @@ pub mod agent;
 pub mod android;
 pub mod http;
 pub mod providers;
+pub mod remote;
 pub mod settings;
 pub mod waydroid;
 pub mod workflow;
